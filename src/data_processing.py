@@ -7,10 +7,11 @@ from pathlib import Path
 
 import airportsdata as ad
 
+# %%
 class DataProcessing:
     def __init__(self):
-        self.cwd = Path.cwd().parent
-        self.excel_path = Path(self.cwd, "data/Airlink - UMichiagn - Data Collection - 9.8.2025.xlsx")
+        self.data_dir = Path(__file__).resolve().parent.parent
+        self.excel_path = Path(self.data_dir, "data/Airlink - UMichiagn - Data Collection - 9.8.2025.xlsx")
         self.mapping = {}
         self.airports = ad.load('IATA')
 
@@ -32,22 +33,22 @@ class DataProcessing:
             pl.col("Origin")
             .map_elements(get_lat_lon, return_dtype=geo_dtype)
             .struct.field("lat")
-            .alias("origin_Lat"),
+            .alias("Origin_Lat"),
 
             pl.col("Origin")
             .map_elements(get_lat_lon, return_dtype=geo_dtype)
             .struct.field("lon")
-            .alias("origin_Lon"),
+            .alias("Origin_Lon"),
 
             pl.col("Destination")
             .map_elements(get_lat_lon, return_dtype=geo_dtype)
             .struct.field("lat")
-            .alias("destination_Lat"),
+            .alias("Destination_Lat"),
 
             pl.col("Destination")
             .map_elements(get_lat_lon, return_dtype=geo_dtype)
             .struct.field("lon")
-            .alias("destination_Lon"),
+            .alias("Destination_Lon"),
         ])
         
         return ret
@@ -56,10 +57,10 @@ class DataProcessing:
     def calculate_distance(self, df: pl.DataFrame) -> pl.DataFrame:
         R = 6371.0  # Earth's radius in km
 
-        dlat = (pl.col("destination_Lat") - pl.col("origin_Lat")).radians()
-        dlon = (pl.col("destination_Lon") - pl.col("origin_Lon")).radians()
-        lat1 = pl.col("origin_Lat").radians()
-        lat2 = pl.col("destination_Lat").radians()
+        dlat = (pl.col("Destination_Lat") - pl.col("Origin_Lat")).radians()
+        dlon = (pl.col("Destination_Lon") - pl.col("Origin_Lon")).radians()
+        lat1 = pl.col("Origin_Lat").radians()
+        lat2 = pl.col("Destination_Lat").radians()
 
         # Haversine formula
         a = ((dlat / 2).sin().pow(2) + lat1.cos() * lat2.cos() * (dlon / 2).sin().pow(2))
@@ -114,10 +115,10 @@ class DataProcessing:
         feature_cols = [
             "Origin",
             'Destination',
-            'origin_Lat',
-            'origin_Lon',
-            'destination_Lat',
-            'destination_Lon',
+            'Origin_Lat',
+            'Origin_Lon',
+            'Destination_Lat',
+            'Destination_Lon',
             "AW (kg)",
             "Pallets",
             'distance'
@@ -146,6 +147,7 @@ class DataProcessing:
         return data_tensor
     
     def transform_new_data(self, df: pl.DataFrame) -> torch.Tensor:
+        raise NotImplementedError("This method needs to be implemented to handle new data preprocessing.")
         # TODO : verify correctness and ability to handle unseen categories if not conditions managed above in preprocessing
         feature_cols = [
             "Origin",
@@ -169,6 +171,13 @@ class DataProcessing:
         data_np = df.select(feature_cols).to_numpy().astype(np.float32)
         return torch.tensor(data_np)
     
+    def process_data(self, filepath: Path) -> torch.Tensor:
+        df_shipping = self.load_shipping_data(filepath)
+        df_geo = self.geolocate_nodes(df_shipping)
+        df_dist = self.calculate_distance(df_geo)
+        data_tensor = self.preprocess_to_tensor(df_dist)
+        return data_tensor
+    
 # %%
 if __name__ == "__main__":
     dp = DataProcessing()
@@ -178,3 +187,4 @@ if __name__ == "__main__":
     # TODO integrate processing
     data_tensor = dp.preprocess_to_tensor(df_dist)
     print(data_tensor.shape)
+# %%
