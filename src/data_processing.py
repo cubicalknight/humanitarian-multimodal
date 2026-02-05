@@ -171,7 +171,10 @@ class DataProcessing:
         data_np = df.select(feature_cols).to_numpy().astype(np.float32)
         return torch.tensor(data_np)
     
-    def process_data(self, filepath: Path) -> torch.Tensor:
+    def process_data(self, filepath: Path = Path()) -> torch.Tensor:
+        if filepath == Path():
+            filepath = self.excel_path
+
         df_shipping = self.load_shipping_data(filepath)
         df_geo = self.geolocate_nodes(df_shipping)
         df_dist = self.calculate_distance(df_geo)
@@ -181,10 +184,11 @@ class DataProcessing:
 # %%
 if __name__ == "__main__":
     dp = DataProcessing()
-    df = dp.load_shipping_data(dp.excel_path)
-    df_geo = dp.geolocate_nodes(df)
-    df_dist = dp.calculate_distance(df_geo)
+    # df = dp.load_shipping_data(dp.excel_path)
+    # df_geo = dp.geolocate_nodes(df)
+    # df_dist = dp.calculate_distance(df_geo)
     # TODO integrate processing
-    data_tensor = dp.preprocess_to_tensor(df_dist)
+    # data_tensor = dp.preprocess_to_tensor(df_dist)
+    data_tensor = dp.process_data()
     print(data_tensor.shape)
 # %%
