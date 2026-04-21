@@ -241,6 +241,7 @@ def summarize_mnlr_results(split: UnifiedDataSplit, class_weight_alpha: float = 
     plt.close()
     # plt.show()
     # print(f"\nSaved confusion matrix plot: {confusion_path}")
+    plt.close()
 
     # Plot normalized confusion matrix (row-wise normalization)
     normalized_matrix = matrix.astype('float') / matrix.sum(axis=1, keepdims=True)
@@ -248,13 +249,11 @@ def summarize_mnlr_results(split: UnifiedDataSplit, class_weight_alpha: float = 
     sns.heatmap(
         normalized_matrix,
         annot=True,
-        fmt=".2%",
+        fmt=".2f",
         cmap="Blues",
         xticklabels=split.label_names,
         yticklabels=split.label_names,
         cbar_kws={"label": "Proportion"},
-        vmin=0,
-        vmax=1,
     )
     plt.xlabel("Predicted", fontsize=CAPTION_FONT_SIZE)
     plt.ylabel("Actual", fontsize=CAPTION_FONT_SIZE)
