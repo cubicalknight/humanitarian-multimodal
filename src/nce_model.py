@@ -17,7 +17,6 @@ import seaborn as sns
 # DIR = os.getcwd()
 
 # %%
-# @dataclass
 class NoiseGeneration:
     def __init__(self, data: torch.Tensor, inflation: float = 1.5):
         mu = torch.mean(data, dim=0)
@@ -38,7 +37,6 @@ class NoiseGeneration:
     def log_prob(self, x: torch.Tensor) -> torch.Tensor:
         return self.dist.log_prob(x)
 
-# @dataclass
 class NoiseContrastiveEstimation(nn.Module):
     def __init__(self, model: nn.Module, noise_gen: NoiseGeneration, noise_multiplier: int = 1):
         super().__init__()
@@ -100,7 +98,8 @@ class TrainNCE:
         hidden_sizes = [trial.suggest_categorical(f'n_units_l{i}', [16, 32, 64, 128, 256]) for i in range(n_layers)]
 
         # TODO address reward hacking issues with noise multiplier
-        noise_multiplier = trial.suggest_int('noise_multiplier', 1, 5)
+        # noise_multiplier = trial.suggest_int('noise_multiplier', 1, 5)
+        noise_multiplier = 1
         # inflation = trial.suggest_float('inflation', 1.0, 5.0)
 
         batch_size = trial.suggest_categorical('batch_size', [16, 32, 64])
@@ -120,8 +119,10 @@ class TrainNCE:
         dataset = torch.utils.data.TensorDataset(self.train_data)
         dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
+        # NOTE we report test lost evaluated at each epoch to allow for pruning and to prevent overfitting
         num_epochs = 30
         for epoch in range(num_epochs):
+            nce_model.train()
             total_loss = 0.0
             for batch in dataloader:
                 obs_batch = batch[0]
@@ -132,16 +133,21 @@ class TrainNCE:
                 optimizer.step()
 
                 total_loss += loss.item()
-            accuracy = total_loss / len(dataloader)
+            # avg_loss = total_loss / len(dataloader)
 
-            trial.report(accuracy, epoch)
+            # trial.report(avg_loss, epoch)
+            # if trial.should_prune():
+            #     raise optuna.exceptions.TrialPruned()
+            
+            nce_model.eval()
+            with torch.no_grad():
+                test_loss = nce_model(self.test_data).item()
+
+            trial.report(test_loss, epoch)
             if trial.should_prune():
                 raise optuna.exceptions.TrialPruned()
-            
-        nce_model.eval()
-        with torch.no_grad():
-            test_loss = nce_model(self.test_data).item()
-            
+        
+        # potentially implement best loss tracking here to prevent overfitting to test set, but for now just return final test loss
         return test_loss
     
     def run_optimization(self, n_trials: int = 50) -> optuna.study.Study:
@@ -169,7 +175,7 @@ class TrainNCE:
         )
 
         noise_gen = NoiseGeneration(self.train_data, inflation=1.5) #best_params['inflation'])
-        nce_model = NoiseContrastiveEstimation(model, noise_gen, noise_multiplier=best_params['noise_multiplier'])
+        nce_model = NoiseContrastiveEstimation(model, noise_gen, noise_multiplier=1) #best_params['noise_multiplier'])
         optimizer = optim.Adam(
             nce_model.parameters(),
             lr=1e-3,
@@ -258,7 +264,7 @@ class TrainNCE:
 
 if __name__ == "__main__":
     data_handler = dp.DataProcessing()
-    complete_tensor_shipping = data_handler.process_data(data_handler.excel_path)
+    complete_tensor_shipping, _ = data_handler.process_data(data_handler.excel_path)
     
     # TODO vary seed for different validation
     torch.manual_seed(42)
