@@ -29,6 +29,7 @@ def build_shared_split(
     data_path: Path | None = None,
     train_ratio: float = 0.7,
     seed: int = 42,
+    stratify: bool = True,
 ) -> UnifiedDataSplit:
     if not (0.0 < train_ratio < 1.0):
         raise ValueError("train_ratio must be strictly between 0 and 1.")
@@ -51,9 +52,38 @@ def build_shared_split(
         )
 
     generator = torch.Generator().manual_seed(seed)
-    permutation = torch.randperm(n_rows, generator=generator)
-    train_indices = permutation[:n_train]
-    test_indices = permutation[n_train:]
+
+    if stratify:
+        train_chunks: list[torch.Tensor] = []
+        test_chunks: list[torch.Tensor] = []
+        class_ids = torch.unique(targets).tolist()
+
+        for class_id in class_ids:
+            class_indices = torch.where(targets == int(class_id))[0]
+            class_size = int(class_indices.shape[0])
+            class_perm = class_indices[torch.randperm(class_size, generator=generator)]
+
+            if class_size <= 1:
+                # Single-sample classes cannot be split across train/test.
+                class_train = class_perm
+                class_test = class_perm.new_empty((0,), dtype=torch.long)
+            else:
+                class_train_size = int(class_size * train_ratio)
+                class_train_size = min(max(class_train_size, 1), class_size - 1)
+                class_train = class_perm[:class_train_size]
+                class_test = class_perm[class_train_size:]
+
+            train_chunks.append(class_train)
+            test_chunks.append(class_test)
+
+        train_indices = torch.cat(train_chunks)
+        test_indices = torch.cat(test_chunks)
+        train_indices = train_indices[torch.randperm(len(train_indices), generator=generator)]
+        test_indices = test_indices[torch.randperm(len(test_indices), generator=generator)]
+    else:
+        permutation = torch.randperm(n_rows, generator=generator)
+        train_indices = permutation[:n_train]
+        test_indices = permutation[n_train:]
 
     train_features = features[train_indices]
     test_features = features[test_indices]

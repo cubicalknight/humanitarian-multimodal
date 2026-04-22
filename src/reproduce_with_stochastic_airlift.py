@@ -163,7 +163,10 @@ def plot_nce_summary_figures(
     return saved_paths
 
 
-def summarize_mnlr_results(split: UnifiedDataSplit, class_weight_alpha: float = 0.75) -> dict[str, Any]:
+def summarize_mnlr_results(
+    split: UnifiedDataSplit,
+    class_weight_alpha: float = 0.75,
+) -> dict[str, Any]:
     print("Training MNLR model with class weight alpha =", class_weight_alpha)
     model, y_true, y_pred = train_torch_mnlr(split, class_weight_alpha=class_weight_alpha)
 
@@ -190,6 +193,12 @@ def summarize_mnlr_results(split: UnifiedDataSplit, class_weight_alpha: float = 
         f"Shared split info: source={split.data_path}, train={len(split.train_indices)}, "
         f"test={len(split.test_indices)}, ratio={split.train_ratio:.2f}/{1 - split.train_ratio:.2f}, seed={split.seed}"
     )
+    all_counts = np.bincount(split.targets.cpu().numpy().astype(int), minlength=len(split.label_names))
+    train_counts = np.bincount(split.train_targets.cpu().numpy().astype(int), minlength=len(split.label_names))
+    test_counts = np.bincount(split.test_targets.cpu().numpy().astype(int), minlength=len(split.label_names))
+    print("Class distribution (all/train/test):")
+    for idx, name in enumerate(split.label_names):
+        print(f"  {name}: {all_counts[idx]}/{train_counts[idx]}/{test_counts[idx]}")
     print(f"Shared input dimensionality: {split.features.shape[1]}")
     print("\nDetailed Performance Metrics:")
     print(
@@ -362,6 +371,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--n-trials", type=int, default=50, help="Optuna trials for the NCE experiment.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed shared by the split and model training.")
     parser.add_argument(
+        "--stratify",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Whether to use deterministic stratified train/test split by aircraft class.",
+    )
+    parser.add_argument(
         "--alpha",
         type=float,
         default=0.75,
@@ -391,7 +406,12 @@ def main() -> None:
         )
 
     shared_data_path = args.aircraft_data if args.aircraft_data is not None else args.nce_data
-    split = build_shared_split(data_path=shared_data_path, train_ratio=0.7, seed=args.seed)
+    split = build_shared_split(
+        data_path=shared_data_path,
+        train_ratio=0.7,
+        seed=args.seed,
+        stratify=args.stratify,
+    )
 
     if args.run in {"mnlr", "all"}:
         if not (0.0 <= args.alpha <= 1.0):
