@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+from nce_model import NoiseGeneration, TrainNCE
+from stochastic_airlift import (
+    MultinomialLogitAircraftModel,
+)
+from unified_data_loader import UnifiedDataSplit, build_shared_split
+
 import argparse
 import random
 import sys
@@ -9,6 +15,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+import matplotlib
 import matplotlib.pyplot as plt
 import seaborn as sns
 import torch
@@ -22,13 +29,29 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 OUTPUT_DIR = SCRIPT_DIR.parent / "output"
-CAPTION_FONT_SIZE = 11
+CAPTION_FONT_SIZE = 19.5
 
-from nce_model import NoiseGeneration, TrainNCE
-from stochastic_airlift import (
-    MultinomialLogitAircraftModel,
-)
-from unified_data_loader import UnifiedDataSplit, build_shared_split
+sns.set_theme(style="darkgrid")
+
+plt.rcParams["axes.labelsize"] = CAPTION_FONT_SIZE*0.7
+plt.rcParams["xtick.labelsize"] = CAPTION_FONT_SIZE*0.7
+plt.rcParams["ytick.labelsize"] = CAPTION_FONT_SIZE*0.7
+
+# NOTE alternatively scale using pgf rather than pdf
+# matplotlib.use('pgf')
+# matplotlib.rcParams.update({
+#     "pgf.texsystem": "pdflatex",
+#     "font.family": "serif",
+#     "text.usetex": True,
+#     "pgf.rcfonts": False,
+
+#     # "font.size": 8,       # Set this to your caption font size (8, 9, or 10)
+#     # "axes.labelsize": 8,  # Match label sizes to caption
+#     # "xtick.labelsize": 8, # Match tick sizes to caption
+#     # "ytick.labelsize": 8, # Match tick sizes to caption
+#     # "legend.fontsize": 8, # Match legend size to caption
+#     "figure.figsize": (3.5, 2.625), # Width (3.5in) and Height in inches
+# })
 
 
 def configure_determinism(seed: int) -> None:
@@ -122,7 +145,6 @@ def plot_nce_summary_figures(
 
     saved_paths: list[Path] = []
 
-    sns.set_theme(style="darkgrid")
     colors = sns.color_palette("deep")
 
     plt.figure()
@@ -131,7 +153,7 @@ def plot_nce_summary_figures(
     sns.kdeplot(noise_probs, color=colors[3], fill=True, alpha=0.5, label="Random Noise")
     plt.xlabel("NCE Probability", fontsize=CAPTION_FONT_SIZE)
     plt.ylabel("Density", fontsize=CAPTION_FONT_SIZE)
-    plt.legend(loc="upper left")
+    plt.legend(loc="upper left", fontsize=CAPTION_FONT_SIZE*0.7)
     plt.tight_layout()
     distribution_path = output_dir / "nce_probability_distribution.pdf"
     plt.savefig(distribution_path, bbox_inches="tight", dpi=300)
@@ -232,15 +254,18 @@ def summarize_mnlr_results(
 
     # Plot confusion matrix using seaborn
     plt.figure()
-    sns.heatmap(
+    hm1 = sns.heatmap(
         matrix,
         annot=True,
+        annot_kws={"size": CAPTION_FONT_SIZE*0.7},
         fmt="d",
         cmap="Blues",
         xticklabels=split.label_names,
         yticklabels=split.label_names,
-        cbar_kws={"label": "Count"},
+        cbar_kws={"label": "Count"}
     )
+    hm1.collections[0].colorbar.set_label("Count", fontsize=CAPTION_FONT_SIZE) # type: ignore
+    
     plt.xlabel("Predicted", fontsize=CAPTION_FONT_SIZE)
     plt.ylabel("Actual", fontsize=CAPTION_FONT_SIZE)
     # plt.title(f"Confusion Matrix - MNLR Aircraft Type (Accuracy: {accuracy:.2%})")
@@ -255,15 +280,19 @@ def summarize_mnlr_results(
     # Plot normalized confusion matrix (row-wise normalization)
     normalized_matrix = matrix.astype('float') / matrix.sum(axis=1, keepdims=True)
     plt.figure()
-    sns.heatmap(
+    hm2 = sns.heatmap(
         normalized_matrix,
         annot=True,
+        annot_kws={"size": CAPTION_FONT_SIZE*0.7},
         fmt=".2f",
         cmap="Blues",
         xticklabels=split.label_names,
         yticklabels=split.label_names,
-        cbar_kws={"label": "Proportion"},
+        cbar_kws={"label": "Proportion"}
     )
+    cbar2 = hm2.collections[0].colorbar
+    cbar2.set_label("Proportion", fontsize=CAPTION_FONT_SIZE) # type: ignore
+
     plt.xlabel("Predicted", fontsize=CAPTION_FONT_SIZE)
     plt.ylabel("Actual", fontsize=CAPTION_FONT_SIZE)
     # plt.title(f"Normalized Confusion Matrix - MNLR Aircraft Type (Accuracy: {accuracy:.2%})")

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import argparse
 import sys
-import time
+# import time
 from pathlib import Path
 from typing import Any
 
@@ -362,13 +362,13 @@ def _train_predictive_models(args):
     nce_device = next(nce_network.parameters()).device
     shipment_feature_tensor = torch.as_tensor(shipment_features, dtype=torch.float32, device=nce_device)
 
-    nce_batch_start = time.perf_counter()
+    # nce_batch_start = time.perf_counter()
     with torch.no_grad():
         nce_scores = nce_network(shipment_feature_tensor).squeeze(-1)
         nce_noise_log_prob = noise_gen.log_prob(shipment_feature_tensor)
         accept_prob_tensor = torch.sigmoid(nce_scores - nce_noise_log_prob)
         accept_prob_tensor = torch.clamp(accept_prob_tensor, 1e-4, 0.9999)
-    nce_batch_seconds = time.perf_counter() - nce_batch_start
+    # nce_batch_seconds = time.perf_counter() - nce_batch_start
     accept_prob_by_shipment = {
         shipment_id: float(accept_prob_tensor[idx].item())
         for idx, shipment_id in enumerate(shipment_ids)
