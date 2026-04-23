@@ -143,6 +143,10 @@ class TwoStageSolver:
         # Build keyed lookup maps from the sequence inputs provided by main.
         self.shipments_by_id = {s.shipment_id: s for s in self.shipments}
         self.S = [s.shipment_id for s in self.shipments]
+        self.shipment_weight_kg = {
+            s.shipment_id: max(0.0, float(s.weight_kg))
+            for s in self.shipments
+        }
 
         self.flights_by_id = {f"{f.route_id}_{f.airline_id}": f for f in self.flights}
         self.F = list(self.flights_by_id.keys())
@@ -172,9 +176,10 @@ class TwoStageSolver:
         )
 
         cost = gp.quicksum(
-            self.flights_by_id[f].cost_flight * x[s, f]
-            for s in self.S 
-            for f in self.F)
+            self.flights_by_id[f].cost_flight * self.shipment_weight_kg[s] * x[s, f]
+            for s in self.S
+            for f in self.F
+        )
 
         return model, x, cost
     
@@ -232,7 +237,9 @@ class TwoStageSolver:
             )
 
         cost = gp.quicksum(
-            self.params.get_reassignment_cost(self.flights_by_id[f].cost_flight) * reassign[s, f, om]
+            self.params.get_reassignment_cost(self.flights_by_id[f].cost_flight)
+            * self.shipment_weight_kg[s]
+            * reassign[s, f, om]
             for s in self.S
             for f in self.F
             for om in Omega
@@ -475,7 +482,8 @@ class TwoStageSolver:
         x2 = model2.addVars(self.S, self.F, vtype=GRB.BINARY, name="x")
         model2.addConstrs((x2[s, f] == x[s, f].X for s in self.S for f in self.F), name="fix_x_from_stage1")
 
-        model2, keep, reassign, recourse_costs = self.stage_two_setup(model2, x2, Omega, scenarios)
+        model2, keep, reassign, non_recourse_costs = self.stage_two_setup(model2, x2, Omega, scenarios)
+        recourse_costs = non_recourse_costs / len(scenarios)
 
         for om in Omega:
             scenario = scenarios[om]

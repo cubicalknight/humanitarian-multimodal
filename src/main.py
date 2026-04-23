@@ -121,14 +121,22 @@ def _explode_airline_names(frame: pl.DataFrame, airline_col: str = "Airline") ->
 
 
 def _build_airline_price_profile(train_frame: pl.DataFrame) -> tuple[dict[str, float], float, int]:
+    weight_column_candidates = ["shipment_weight_kg", "AW (kg)"]
+    weight_column = next((c for c in weight_column_candidates if c in train_frame.columns), None)
+
     required_columns = {"Airline", "Commercial Cost for Long-Haul", "distance"}
     missing_columns = sorted(required_columns.difference(train_frame.columns))
     if missing_columns:
         raise ValueError(f"Cannot build airline price profile; missing columns: {missing_columns}")
+    if weight_column is None:
+        raise ValueError(
+            "Cannot build airline price profile; missing shipment weight column. "
+            f"Expected one of {weight_column_candidates}."
+        )
 
     priced_rows = (
         _explode_airline_names(
-            train_frame.select(["Airline", "Commercial Cost for Long-Haul", "distance"]),
+            train_frame.select(["Airline", "Commercial Cost for Long-Haul", "distance", weight_column]),
             airline_col="Airline",
         )
         .with_columns([
@@ -138,16 +146,22 @@ def _build_airline_price_profile(train_frame: pl.DataFrame) -> tuple[dict[str, f
             .cast(pl.Float64, strict=False)
             .alias("long_haul_cost"),
             pl.col("distance").cast(pl.Utf8).str.replace_all(",", "").cast(pl.Float64, strict=False).alias("distance_km"),
+            pl.col(weight_column).cast(pl.Utf8).str.replace_all(",", "").cast(pl.Float64, strict=False).alias("shipment_weight_kg"),
         ])
         .with_columns((pl.col("distance_km") * 0.621371).alias("distance_miles"))
         .filter(
             pl.col("long_haul_cost").is_not_null()
             & pl.col("distance_miles").is_not_null()
+            & pl.col("shipment_weight_kg").is_not_null()
             & (pl.col("long_haul_cost") > 0)
             & (pl.col("distance_miles") > 0)
+            & (pl.col("shipment_weight_kg") > 0)
         )
-        .with_columns((pl.col("long_haul_cost") / pl.col("distance_miles")).alias("price_per_mile"))
+        .with_columns((pl.col("long_haul_cost") / (pl.col("distance_miles") * pl.col("shipment_weight_kg"))).alias("price_per_mile_kg"))
     )
+
+    # print(priced_rows.head(5))
+    # sys.exit(0)
 
     if priced_rows.is_empty():
         raise ValueError("No valid airline pricing rows remained after cleaning training data.")
@@ -155,9 +169,12 @@ def _build_airline_price_profile(train_frame: pl.DataFrame) -> tuple[dict[str, f
     airline_mean_price_per_mile = (
         priced_rows
         .group_by("airline_name")
-        .agg(pl.col("price_per_mile").mean().alias("mean_price_per_mile"))
+        .agg(pl.col("price_per_mile_kg").mean().alias("mean_price_per_mile"))
         .sort("airline_name")
     )
+
+    # print(airline_mean_price_per_mile.head(5))
+    # sys.exit(0)
 
     airline_price_map = {
         str(row[0]): float(row[1])
@@ -166,7 +183,7 @@ def _build_airline_price_profile(train_frame: pl.DataFrame) -> tuple[dict[str, f
     if not airline_price_map:
         raise ValueError("No airline price-per-mile statistics could be computed.")
 
-    global_mean_price_per_mile = float(priced_rows.select(pl.col("price_per_mile").mean()).item())
+    global_mean_price_per_mile = float(priced_rows.select(pl.col("price_per_mile_kg").mean()).item())
     if not np.isfinite(global_mean_price_per_mile) or global_mean_price_per_mile <= 0:
         raise ValueError(f"Invalid global mean price-per-mile computed: {global_mean_price_per_mile}")
 
@@ -450,13 +467,13 @@ def main() -> tuple[Any, Any]:
     # )
 
     # \ra
-    params = StochasticOptimizationParameters(
+    PARAMS = StochasticOptimizationParameters(
         cost_penalty_rejection=5000.0,
-        cost_penalty_incompatibility=2500.0,
+        cost_penalty_incompatibility=0.0,
         cost_reassignment=1200.0,
     )
 
-    solver = TwoStageSolver(shipments, flights, params)
+    solver = TwoStageSolver(shipments, flights, PARAMS)
     print("Solving SAA problem...")
 
     saa_solution, mod = solver.solve_sample_average(scenarios=scenarios)
@@ -503,6 +520,53 @@ def main() -> tuple[Any, Any]:
         # print("Myopic Run")
     myopic_solution, mod2 = solver.solve_myopic(scenarios=scenarios)
 
+    # Diagnostics from exact binary decision variables in the solved models.
+    incompatible_lookup = {
+        (ur.shipment_id, ur.flight_id, om)
+        for om, scenario in enumerate(scenarios)
+        for ur in scenario
+        if ur.acceptance and not ur.compatibility
+    }
+
+    def _parse_triplet_var_name(var_name: str) -> tuple[str, str, int] | None:
+        start = var_name.find("[")
+        end = var_name.rfind("]")
+        if start == -1 or end == -1 or end <= start + 1:
+            return None
+        parts = [p.strip() for p in var_name[start + 1:end].split(",", 2)]
+        if len(parts) != 3:
+            return None
+        try:
+            return parts[0], parts[1], int(parts[2])
+        except ValueError:
+            return None
+
+    def _totals_from_model(model) -> tuple[int, int]:
+        total_reassignments = 0
+        total_incompatibles = 0
+        for var in model.getVars():
+            if var.X <= 0.5:
+                continue
+
+            parsed = _parse_triplet_var_name(var.VarName)
+            if parsed is None:
+                continue
+            shipment_id, flight_id, om = parsed
+            key = (shipment_id, flight_id, om)
+
+            if var.VarName.startswith("reassign["):
+                total_reassignments += 1
+                if key in incompatible_lookup:
+                    total_incompatibles += 1
+            elif var.VarName.startswith("keep["):
+                if key in incompatible_lookup:
+                    total_incompatibles += 1
+
+        return total_reassignments, total_incompatibles
+
+    saa_total_reassignments, saa_total_incompatibilities = _totals_from_model(mod)
+    myopic_total_reassignments, myopic_total_incompatibilities = _totals_from_model(mod2)
+    
     #     total_costs.append((saa_solution.expected_total_cost, myopic_solution.expected_total_cost))
     #     first_stage_costs.append((saa_solution.first_stage.objective_value, myopic_solution.first_stage.objective_value))
     #     second_stage_costs.append((saa_solution.second_stage.objective_value, myopic_solution.second_stage.objective_value))
@@ -521,9 +585,15 @@ def main() -> tuple[Any, Any]:
     print(f"SAA expected total cost: {saa_solution.expected_total_cost:,.2f}")
     print(f"Myopic total expected cost: {myopic_solution.expected_total_cost:,.2f}")
     print(f"Cost difference (Myopic - SAA): {myopic_solution.expected_total_cost - saa_solution.expected_total_cost:,.2f}")
-    print(f"Percent reduction: {100.0 * (saa_solution.expected_total_cost - myopic_solution.expected_total_cost) / saa_solution.expected_total_cost:.2f}%")
+    print(f"Percent reduction: {100.0 * (saa_solution.expected_total_cost - myopic_solution.expected_total_cost) / myopic_solution.expected_total_cost:.2f}%")
     print("First stage difference (Myopic - SAA):", (myopic_solution.first_stage.objective_value - saa_solution.first_stage.objective_value))
     print("Second stage difference (Myopic - SAA):", (myopic_solution.second_stage.objective_value - saa_solution.second_stage.objective_value))
+
+    print("\n=== Totals By Model ===")
+    print(f"SAA total reassignments: {saa_total_reassignments}")
+    print(f"SAA total incompatible flights: {saa_total_incompatibilities}")
+    print(f"Myopic total reassignments: {myopic_total_reassignments}")
+    print(f"Myopic total incompatible flights: {myopic_total_incompatibilities}")
     return saa_solution, mod
 
 
