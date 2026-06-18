@@ -303,8 +303,12 @@ def _build_flights(
 
     return flights, fallback_cost_count
 
-
+# NOTE bootleg fix
+split = None
+train_frame = None
+test_frame = None
 def _train_predictive_models(args):
+    global split, train_frame, test_frame
     configure_determinism(args.seed)
     rng = np.random.default_rng(args.seed)
 
@@ -468,9 +472,9 @@ def main() -> tuple[Any, Any]:
 
     # \ra
     PARAMS = StochasticOptimizationParameters(
-        cost_penalty_rejection=5000.0,
+        cost_penalty_rejection=50000.0,
         cost_penalty_incompatibility=0.0,
-        cost_reassignment=1200.0,
+        cost_reassignment=12000.0,
     )
 
     solver = TwoStageSolver(shipments, flights, PARAMS)
@@ -594,6 +598,55 @@ def main() -> tuple[Any, Any]:
     print(f"SAA total incompatible flights: {saa_total_incompatibilities}")
     print(f"Myopic total reassignments: {myopic_total_reassignments}")
     print(f"Myopic total incompatible flights: {myopic_total_incompatibilities}")
+
+    # Historic assignments represented as one variable per Origin-Destination-Airline triplet.
+    route_airline_triplets: set[tuple[str, str, str]] = set()
+    global train_frame, test_frame
+    for frame in (train_frame, test_frame):
+        if frame is None:
+            continue
+        for row in frame.iter_rows(named=True):
+            origin = str(row.get("Origin", ""))
+            destination = str(row.get("Destination", ""))
+            airline = str(row.get("Airline", ""))
+            if not origin or not destination or not airline:
+                continue
+            for airline_name in airline.split(","):
+                airline_name = airline_name.strip()
+                if airline_name:
+                    route_airline_triplets.add((origin, destination, airline_name))
+
+    # Build shipment -> (origin, destination) lookup without relying on global frames.
+    shipment_route_by_id = {
+        shipment.shipment_id: (shipment.origin, shipment.destination)
+        for shipment in shipments
+    }
+
+    # compare the historic triplets with the SAA and Myopic assignments
+    def _extract_assignments(solution, shipment_routes: dict[str, tuple[str, str]]) -> set[tuple[str, str, str]]:
+        assignments: set[tuple[str, str, str]] = set()
+        for (shipment_id, flight_id), value in solution.first_stage.assignments.items():
+            if value > 0.5:
+                _, airline_id = flight_id.split("_", 1)
+                route = shipment_routes.get(shipment_id)
+                if route is not None:
+                    origin, destination = route
+                    assignments.add((origin, destination, airline_id))
+        return assignments
+    
+    saa_assignments = _extract_assignments(saa_solution, shipment_route_by_id)
+    myopic_assignments = _extract_assignments(myopic_solution, shipment_route_by_id)
+
+    historic_assignments = route_airline_triplets
+
+    print("\n=== Assignment Comparison ===")
+    print(f"Historic assignments: {len(historic_assignments)}")
+    print(f"SAA assignments: {len(saa_assignments)}")
+    print(f"Myopic assignments: {len(myopic_assignments)}")
+
+    print(f"Historic vs SAA overlap: {len(historic_assignments.intersection(saa_assignments))}")
+    print(f"Historic vs Myopic overlap: {len(historic_assignments.intersection(myopic_assignments))}")
+    print(f"SAA vs Myopic overlap: {len(saa_assignments.intersection(myopic_assignments))}")
     return saa_solution, mod
 
 
