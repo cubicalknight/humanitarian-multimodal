@@ -144,6 +144,14 @@ class DataProcessing:
             .struct.field("lon")
             .alias("Destination_Lon"),
         ])
+
+        # filter out rows where geolocation failed for either origin or destination
+        ret = ret.filter(
+            pl.col("Origin_Lat").is_not_null() &
+            pl.col("Origin_Lon").is_not_null() &
+            pl.col("Destination_Lat").is_not_null() &
+            pl.col("Destination_Lon").is_not_null()
+        )
         
         return ret
     
