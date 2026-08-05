@@ -58,7 +58,7 @@ class FeatureConfig:
     
 
 class DataProcessing:
-    def __init__(self, feature_config: FeatureConfig | None = None, separate_target: bool = True):
+    def __init__(self, feature_config: FeatureConfig | None = None, separate_target: bool = False):
         self.data_dir = Path(__file__).resolve().parent.parent
         self.excel_path = Path(self.data_dir, "data/Airlink - UMichiagn - Data Collection - 9.8.2025.xlsx")
         self.mapping = {}
@@ -176,8 +176,11 @@ class DataProcessing:
         return ret
         
 
-    def load_shipping_data(self, filepath: Path) -> pl.DataFrame:
+    def load_shipping_data(self, filepath: Path | None = None) -> pl.DataFrame:
         # Read Raw (as strings) to handle mixed headers
+        if filepath is None:
+            filepath = self.excel_path
+
         df_raw = pl.read_excel(filepath, has_header=False, infer_schema_length=0)
 
         # Extract Year & Clean
@@ -217,25 +220,31 @@ class DataProcessing:
         df_final = self._canonicalize_route_columns(df_final)
 
         # TODO in df final, check origin destination, if either is not in airports data, raise error with list of unknown codes
-        origin_codes = set(df_final["Origin"].unique().to_list())
-        destination_codes = set(df_final["Destination"].unique().to_list())
+        origin_codes = set(df_final["ORIGIN"].unique().to_list())
+        destination_codes = set(df_final["DEST"].unique().to_list())
         unknown_origin_codes = sorted(origin_codes.difference(self.airports.keys()), key=lambda value: str(value))
         unknown_destination_codes = sorted(destination_codes.difference(self.airports.keys()), key=lambda value: str(value))
-        # if unknown_origin_codes or unknown_destination_codes:
-        #     raise ValueError(
-        #         f"Unknown airport codes found. Unknown Origins: {unknown_origin_codes}, Unknown Destinations: {unknown_destination_codes}. "
-        #         "Please ensure all Origin and Destination codes are valid IATA codes present in the airports dataset."
-        #     )
+
+        # Warn (rather than raise) when unknown airport codes are present so callers
+        # can inspect problematic codes without stopping execution. Rows with these
+        # codes will be dropped afterwards.
+        if unknown_origin_codes or unknown_destination_codes:
+            warnings.warn(
+                f"Unknown airport codes found. Unknown Origins: {unknown_origin_codes}, "
+                f"Unknown Destinations: {unknown_destination_codes}. Rows with these codes will be dropped.",
+                UserWarning,
+            )
 
         # NOTE drop these rows for now
         df_final = df_final.filter(
-            ~pl.col("Origin").is_in(unknown_origin_codes) &
-            ~pl.col("Destination").is_in(unknown_destination_codes)
-        ).rename({
-            "Origin": "ORIGIN",
-            "Destination": "DEST",
-            "Airline": "UNIQUE_CARRIER",
-        })
+            ~pl.col("ORIGIN").is_in(unknown_origin_codes) &
+            ~pl.col("DEST").is_in(unknown_destination_codes)
+        )
+        # .rename({
+        #     "Origin": "ORIGIN",
+        #     "Destination": "DEST",
+        #     "Airline": "UNIQUE_CARRIER",
+        # })
 
         return df_final
 
@@ -525,18 +534,27 @@ class T100DataProcessing(DataProcessing):
 
 # %%
 if __name__ == "__main__":
-    dp = DataProcessing()
-    df = dp.load_shipping_data(dp.excel_path)
-    df_geo = dp._geolocate_nodes(df)
-    df_dist = dp._calculate_distance(df_geo)
-    # TODO integrate processing
-    # data_tensor = dp.preprocess_to_tensor(df_dist)
-    # data_tensor, target_tensor = dp.process_data()
-    # print(data_tensor.shape)
-    # sys.exit(0)
+    # dp = DataProcessing()
+    # df = dp.load_shipping_data(dp.excel_path)
+    # df_geo = dp._geolocate_nodes(df)
+    # df_dist = dp._calculate_distance(df_geo)
+    # # TODO integrate processing
+    # # data_tensor = dp.preprocess_to_tensor(df_dist)
+    # # data_tensor, target_tensor = dp.process_data()
+    # # print(data_tensor.shape)
+    # # sys.exit(0)
     t100 = T100DataProcessing()
     df = t100.filter_data()
-    # t100geo = t100._geolocate_nodes(df)
-    cat_tensor, num_tensor, target_tensor = t100.to_tensor(df)
+    t100geo = t100._geolocate_nodes(df)
+    t100dist = t100._calculate_distance(t100geo)
+    tensor = t100.to_tensor(t100dist, is_training=True, simple=True)
+
+    # make sure encoding aligns
+    ship = DataProcessing()
+    ship.align_from(t100)
+    df_ship = ship.load_shipping_data()
+    ship_geo = ship._geolocate_nodes(df_ship)
+    ship_dist = ship._calculate_distance(ship_geo)
+    ship_tensor = ship.to_tensor(ship_dist, is_training=False, simple=True)
 
 # %%
