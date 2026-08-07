@@ -4,3 +4,5 @@
 src/predictive-elements.pkl
 *.pyc
 *.pkl
+/sbi-logs
+/notebooks/sbi-logs
