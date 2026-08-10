@@ -390,7 +390,7 @@ class DataProcessing:
         data_ = self._encode_features(df, is_training=is_training)
 
         self.cat_cols = [c for c in self.features.categorical_features if c in data_.columns]
-        self.cat_sizes = [len(self.mapping[c]) for c in self.cat_cols]
+        self.cat_sizes = [len(self.mapping[c]) + 1 for c in self.cat_cols]
         if self.cat_cols:
             cat_tensor = torch.tensor(data_.select(self.cat_cols).to_numpy().astype(np.int64), dtype=torch.long)
         else:
