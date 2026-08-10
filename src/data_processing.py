@@ -14,11 +14,11 @@ from scipy.stats import truncnorm
 # %%
 @dataclass
 class FeatureConfig:
-    target_column: str = "Aircraft Type"
+    target_column: str = "AW (kg)" # default as realistically should only be used for shipping data
 
     # standardized naming conventions
     categorical_features: list[str] = field(default_factory=lambda: [
-        "ORIGIN", "DEST", "UNIQUE_CARRIER"])
+        "ORIGIN", "DEST"]) # UNIQUE_CARRIER
 
     # categorical_features: list[str] = field(default_factory=lambda: [
     #     "Origin", "Destination"])
@@ -73,9 +73,11 @@ class DataProcessing:
         rename_map = {
             "Origin": "ORIGIN",
             "Destination": "DEST",
-            "Airline": "UNIQUE_CARRIER",
+            # "Airline": "UNIQUE_CARRIER",
             "distance": "DISTANCE",
         }
+        warnings.warn("Temporarily removed unique_carrier due to naming misalignment")
+
         active_renames = {
             source: target
             for source, target in rename_map.items()
@@ -255,15 +257,16 @@ class DataProcessing:
         df = self._canonicalize_route_columns(df)
         
         # 1. Encode Target (if it exists in this dataset)
-        if target_col in df.columns and self.separate_target:
-            if is_training and target_col not in self.mapping:
-                uniq_targets = sorted(df[target_col].drop_nulls().unique().to_list())
-                self.mapping[target_col] = {val: idx for idx, val in enumerate(uniq_targets)}
+        # NOTE no longer necessary to encode target as it is not used in the current training pipeline 
+        # if target_col in df.columns and self.separate_target:
+        #     if is_training and target_col not in self.mapping:
+        #         uniq_targets = sorted(df[target_col].drop_nulls().unique().to_list())
+        #         self.mapping[target_col] = {val: idx for idx, val in enumerate(uniq_targets)}
             
-            target_map = self.mapping[target_col]
-            df = df.with_columns(
-                pl.Series(target_col, [target_map.get(val, -1) for val in df[target_col]], dtype=pl.Int32)
-            )
+        #     target_map = self.mapping[target_col]
+        #     df = df.with_columns(
+        #         pl.Series(target_col, [target_map.get(val, -1) for val in df[target_col]], dtype=pl.Int32)
+        #     )
 
         # 2. Encode Features
         for col in self.features.all_features:
@@ -386,16 +389,17 @@ class DataProcessing:
         
         data_ = self._encode_features(df, is_training=is_training)
 
-        cat_cols = [c for c in self.features.categorical_features if c in data_.columns]
-        if cat_cols:
-            cat_tensor = torch.tensor(data_.select(cat_cols).to_numpy().astype(np.int64), dtype=torch.long)
+        self.cat_cols = [c for c in self.features.categorical_features if c in data_.columns]
+        self.cat_sizes = [len(self.mapping[c]) for c in self.cat_cols]
+        if self.cat_cols:
+            cat_tensor = torch.tensor(data_.select(self.cat_cols).to_numpy().astype(np.int64), dtype=torch.long)
         else:
             cat_tensor = torch.empty((data_.shape[0], 0), dtype=torch.long)
 
-        num_cols = [c for c in self.features.numerical_features if c in data_.columns]
+        self.num_cols = [c for c in self.features.numerical_features if c in data_.columns]
         num_tensor = torch.empty((data_.shape[0], 0), dtype=torch.float32)
-        if num_cols:    
-            input_tensor = torch.tensor(data_.select(num_cols).to_numpy().astype(np.float32), dtype=torch.float32)
+        if self.num_cols:    
+            input_tensor = torch.tensor(data_.select(self.num_cols).to_numpy().astype(np.float32), dtype=torch.float32)
         # # Normalize data for ease of training
         # # TODO do normalization elsewhere to prevent data leakage and ensure correct handling of new data
             # num_tensor = self._normalize_data(input_tensor, is_training=is_training)
@@ -404,8 +408,8 @@ class DataProcessing:
 
         target_tensor = None
         if self.features.target_column in data_.columns and self.separate_target:
-            target_array = data_.select(self.features.target_column).to_numpy().astype(np.int64)
-            target_tensor = torch.tensor(target_array, dtype=torch.int64)
+            target_array = data_.select(self.features.target_column).to_numpy().astype(np.float64)
+            target_tensor = torch.tensor(target_array, dtype=torch.float64)
         # torch.tensor(data_.select(self.features.target_column).to_numpy().astype(np.int64))
         # breakpoint()
         if simple:
