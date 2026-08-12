@@ -6,3 +6,4 @@ src/predictive-elements.pkl
 *.pkl
 /sbi-logs
 /notebooks/sbi-logs
+*.png

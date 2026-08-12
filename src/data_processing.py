@@ -177,6 +177,23 @@ class DataProcessing:
 
         return ret
         
+    def count_od_overlap(self, shipping_df: pl.DataFrame, t100_df: pl.DataFrame) -> int:
+        """Counts how many unique origin-destination pairs in shipping data are present in t100 data."""
+        overlap_df = self.get_od_overlap(shipping_df, t100_df)
+        return overlap_df.height
+
+    def get_od_overlap(self, shipping_df: pl.DataFrame, t100_df: pl.DataFrame) -> pl.DataFrame:
+        """Returns the shipping dataframe filtered to only include rows whose origin-destination pairs are present in t100 data."""
+        # Ensure columns are canonicalized
+        shipping_df = self._canonicalize_route_columns(shipping_df)
+        t100_df = self._canonicalize_route_columns(t100_df)
+
+        t100_pairs = t100_df.select(["ORIGIN", "DEST"]).unique()
+
+        # Semi join returns rows from the left table that have a match in the right table
+        overlap = shipping_df.join(t100_pairs, on=["ORIGIN", "DEST"], how="semi")
+        
+        return overlap
 
     def load_shipping_data(self, filepath: Path | None = None) -> pl.DataFrame:
         # Read Raw (as strings) to handle mixed headers
@@ -547,18 +564,48 @@ if __name__ == "__main__":
     # # data_tensor, target_tensor = dp.process_data()
     # # print(data_tensor.shape)
     # # sys.exit(0)
-    t100 = T100DataProcessing()
-    df = t100.filter_data()
-    t100geo = t100._geolocate_nodes(df)
-    t100dist = t100._calculate_distance(t100geo)
-    tensor = t100.to_tensor(t100dist, is_training=True, simple=True)
+    
+    # t100 = T100DataProcessing()
+    # df = t100.filter_data()
+    # t100geo = t100._geolocate_nodes(df)
+    # t100dist = t100._calculate_distance(t100geo)
+    # tensor = t100.to_tensor(t100dist, is_training=True, simple=True)
 
-    # make sure encoding aligns
-    ship = DataProcessing()
-    ship.align_from(t100)
-    df_ship = ship.load_shipping_data()
-    ship_geo = ship._geolocate_nodes(df_ship)
-    ship_dist = ship._calculate_distance(ship_geo)
-    ship_tensor = ship.to_tensor(ship_dist, is_training=False, simple=True)
+    # # make sure encoding aligns
+    # ship = DataProcessing()
+    # ship.align_from(t100)
+    # df_ship = ship.load_shipping_data()
+    # ship_geo = ship._geolocate_nodes(df_ship)
+    # ship_dist = ship._calculate_distance(ship_geo)
+    # ship_tensor = ship.to_tensor(ship_dist, is_training=False, simple=True)
+
+    # 1. Initialize the processors
+    dp = DataProcessing()
+    t100_processor = T100DataProcessing()
+
+    # 2. Load the shipping data
+    # This uses the default path defined in DataProcessing
+    df_shipping = dp.load_shipping_data()
+
+    # 3. Load the T100 data
+    # T100DataProcessing has the data loaded in self.t100_data, 
+    # or you can use filter_data() to get the cleaned version
+    df_t100 = t100_processor.filter_data()
+
+    # 4. Count the overlap
+    overlap_count = dp.count_od_overlap(df_shipping, df_t100)
+
+    print(f"Number of unique O-D pairs in shipping data also found in T100: {overlap_count}")
+
+    # Get the actual DataFrame of overlapping pairs
+    overlap_df = dp.get_od_overlap(df_shipping, df_t100)
+
+    # Print the pairs
+    print("Overlapping Origin-Destination pairs:")
+    print(overlap_df)
+
+    # Or iterate through them
+    for row in overlap_df.iter_rows(named=True):
+        print(f"Origin: {row['ORIGIN']}, Destination: {row['DEST']}")
 
 # %%
