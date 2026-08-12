@@ -15,3 +15,11 @@ dependencies = ["numpy (>=2.3.4,<3.0.0)", "polars (>=1.34.0,<2.0.0)", "matplotli
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]
 build-backend = "poetry.core.masonry.api"
+
+[[tool.poetry.source]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+priority = "explicit"
+
+[tool.poetry.dependencies]
+torch = { version = ">=2.10.0,<3.0.0", source = "pytorch-cu128" }

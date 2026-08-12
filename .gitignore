@@ -7,3 +7,5 @@ src/predictive-elements.pkl
 /sbi-logs
 /notebooks/sbi-logs
 *.png
+*.sbat
+*.out
