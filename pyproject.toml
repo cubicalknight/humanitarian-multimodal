@@ -17,9 +17,9 @@ requires = ["poetry-core>=2.0.0,<3.0.0"]
 build-backend = "poetry.core.masonry.api"
 
 [[tool.poetry.source]]
-name = "pytorch-cu128"
-url = "https://download.pytorch.org/whl/cu128"
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
 priority = "explicit"
 
 [tool.poetry.dependencies]
-torch = { version = ">=2.10.0,<3.0.0", source = "pytorch-cu128" }
+torch = { version = ">=2.10.0,<3.0.0", source = "pytorch-cu126" }
