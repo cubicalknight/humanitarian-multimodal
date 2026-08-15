@@ -9,3 +9,4 @@ src/predictive-elements.pkl
 *.png
 *.sbat
 *.out
+/run_outputs

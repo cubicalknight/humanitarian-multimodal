@@ -1,6 +1,8 @@
 #!/usr/bin/env python
 import pathlib
 from dataclasses import dataclass
+import sys
+import json
 
 import numpy as np
 import polars as pl
@@ -11,6 +13,8 @@ from torch.distributions import MultivariateNormal
 
 torch.manual_seed(42)
 np.random.seed(42)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
 
 from sbi.utils import BoxUniform
 from sbi.inference import NPE, simulate_for_sbi
@@ -19,6 +23,10 @@ from sbi.neural_nets.embedding_nets import (
     FCEmbedding,
     PermutationInvariantEmbedding
 )
+from sbi.analysis import pairplot, sbc_rank_plot
+from sbi.diagnostics import run_sbc
+
+import matplotlib.pyplot as plt
 
 from scipy.stats import lognorm
 
@@ -48,7 +56,7 @@ class SyntheticGeneratorConfig:
 
 
 class HyperPrior:
-    def __init__(self, psi_min: float = 1e-3, psi_max: float = 1e3) -> None:
+    def __init__(self, psi_min: float = 1e-1, psi_max: float = 1e1) -> None:
         self.psi_min = psi_min
         self.psi_max = psi_max
 
@@ -74,6 +82,7 @@ class SyntheticDataGenerator:
 
     def __init__(self, config: SyntheticGeneratorConfig | None = None, shipping_data: DataProcessing | None = None) -> None:
         self.config = config or SyntheticGeneratorConfig()
+        self.device = device
         # Random number stream – keep a single PRNG instance for deterministic runs.
         self.rng = np.random.default_rng(self.config.seed)
         self.proc = T100DataProcessing()
@@ -91,13 +100,73 @@ class SyntheticDataGenerator:
     #  Loading / preprocessing
     # -------------------------------------------------------------------
 
+
+    def _get_nominal_slack(self, n_samples: int = 1) -> np.ndarray:
+        """Calculate the nominal slack (before draw-down) for a random subset of flights."""
+        # Sample flights to get the baseline slack
+        self._sample_flights(n_samples=n_samples)
+        mu_z = (
+            self.u_max_sel
+            - self.u_cargo_sel
+            - self.u_mail_sel
+            - (self.u_pax_sel * self.proc.mu_pax)
+        )
+        sigma_z = np.sqrt(np.maximum(self.u_pax_sel, 0.0)) * self.proc.sigma_pax
+        return self.proc._truncated_slack_samples(
+            mu_z, sigma_z, n_draws=1
+        ).reshape(-1).astype(np.float32)
+
+    def _augment_shipping_data(self, max_rows: int = 100, num_rows: int = 100) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # Create a local copy of shipping data to prevent overwriting the class attribute
+        aug_ship_dist = self.ship_dist[:max_rows].clone()
+        aug_ship_dist = aug_ship_dist.with_columns(pl.col("AW (kg)").cast(pl.Float64))
+
+        # Since observation() is called early, z_gen_sel might not exist.
+        # We generate nominal slack samples specifically for augmentation.
+        # We need enough slack samples to cover the shipping data selection.
+        z_nominal = self._get_nominal_slack(n_samples=len(aug_ship_dist))
+
+        # take the shipping dist and add a set of new rows identical to the 
+        # existing rows with the main difference being that the weight will be greater than or equal 
+        # to the slack value for that observation setting S = 1 for that row 
+
+        for _ in range(num_rows):
+            # randomly select a row from the shipping data
+            idx = self.rng.choice(len(aug_ship_dist))
+            row = aug_ship_dist[idx]
+
+            # create a new row with the same values but with a weight greater than or equal to the slack value
+            new_row = row.clone()
+            # new_row is a Series, so we access the value using .item() or [0]
+            weight_val = float(new_row["AW (kg)"][0])
+            slack_val = float(z_nominal[idx % len(z_nominal)])
+
+            # new_row = new_row.with_columns(pl.lit(max(weight_val, slack_val - 3e3)).alias("AW (kg)"))
+            new_row = new_row.with_columns(pl.lit(weight_val + 1e1).alias("AW (kg)"))
+            # append the new row to the local augmented dataframe
+            aug_ship_dist = aug_ship_dist.vstack(new_row)
+
+        # Derive U and W from the local augmented dataframe, sampled to max_rows
+        U = torch.tensor(self._apply_one_hot_mapping(aug_ship_dist[:(max_rows + num_rows)]), dtype=torch.float32)
+        W = torch.tensor(aug_ship_dist[:(max_rows + num_rows)]["AW (kg)"].to_numpy(), dtype=torch.float32).unsqueeze(1)
+        
+        # S = 1 for the original rows and 0 for the augmented rows
+        # NOTE bootleg fix
+        orig_count = len(self.observed_weight_tensor[:max_rows])
+        s_labels = [1.0 if i < orig_count else 0.0 for i in range(max_rows + num_rows)]
+        S = torch.tensor(s_labels, dtype=torch.float32).unsqueeze(1)
+
+        return U, W, S
+
     def _load_shipping_data(self) -> None:
         """Load and preprocess the shipping data."""
         self.shipping_proc.align_from(self.proc)
         
         df_shipping = self.shipping_proc.load_shipping_data()
         ship_geo = self.shipping_proc._geolocate_nodes(df_shipping)
-        self.ship_dist = self.shipping_proc._calculate_distance(ship_geo)
+        ship_dist = self.shipping_proc._calculate_distance(ship_geo)
+
+        self.ship_dist = self.shipping_proc.get_od_overlap(ship_dist, self.df)
 
         self.observed_ship_tensor, self.observed_weight_tensor = self.shipping_proc.to_tensor(
             self.ship_dist, is_training=False, simple=True
@@ -193,8 +262,10 @@ class SyntheticDataGenerator:
         return np.exp(log_alpha), np.exp(log_beta)
 
     def _draw_down(self, design_matr: np.ndarray) -> np.ndarray:
+        scaling_factor = 1e4
+
         alpha_i, beta_i = self._alpha_beta(design_matr)
-        return self.rng.gamma(alpha_i, beta_i).astype(np.float32)
+        return (self.rng.gamma(alpha_i, beta_i) * scaling_factor).astype(np.float32)
 
     def _standardize_features(self) -> None:
         self.X_mean = self.X_full.mean(axis=0, keepdims=True)
@@ -280,7 +351,7 @@ class SyntheticDataGenerator:
 
         if theta.ndim == 1:
             # 1. Redraw a new set of 100 flights for this simulation
-            self._sample_flights(n_samples=100)
+            self._sample_flights(n_samples=40)
 
             # 1.5 Update the design matrix for the selected flights
             # self.design_sell = self.design_full[self.idx]
@@ -323,17 +394,18 @@ class SyntheticDataGenerator:
 
     def observation(self) -> torch.Tensor:
         """Build a fixed observation tensor for posterior conditioning."""
-        max_rows = 500
+        max_rows = 100 # 500 reduced to 100 due to smaller true overlap size
 
         # select first 500 rows of the shipping data for the observation
         # U = self.observed_ship_tensor[:max_rows]
-        U = torch.tensor(self._apply_one_hot_mapping(self.ship_dist[:max_rows]), dtype=torch.float32)
-        W = self.observed_weight_tensor[:max_rows].to(torch.float32)
-        S = torch.ones_like(W)  # all weights are valid for the observation
+        # U = torch.tensor(self._apply_one_hot_mapping(self.ship_dist[:max_rows]), dtype=torch.float32)
+        # W = self.observed_weight_tensor[:max_rows].to(torch.float32)
+        # S = torch.ones_like(W)  # all weights are valid for the observation
 
-        print(f"U dtype: {U.dtype}, W dtype: {W.dtype}, S dtype: {S.dtype}")
+        # print(f"U dtype: {U.dtype}, W dtype: {W.dtype}, S dtype: {S.dtype}")
+        U, S, W = self._augment_shipping_data(max_rows=max_rows, num_rows=100)
 
-        return torch.cat([U, W, S], dim=1)
+        return torch.cat([U, W, S], dim=1).to(self.device)
 
     def generate(self) -> dict:
         """
@@ -429,6 +501,10 @@ def _demo() -> None:
     generator.print_sample()
     # breakpoint() # enable interactive debugging when needed
 
+import optuna
+def objective(trial: optuna.Trial):
+    pass
+
 
 if __name__ == "__main__":
     # _demo()
@@ -449,11 +525,41 @@ if __name__ == "__main__":
     # )
 
     prior = MultivariateNormal(
-        loc=torch.zeros(2 * generator.n_design),
-        covariance_matrix=torch.eye(2 * generator.n_design) * 9.0,
+        loc=torch.zeros(2 * generator.n_design, device=device),
+        covariance_matrix=torch.eye(2 * generator.n_design, device=device) * 15.0**2,
     )
 
     simulator = generator.simulator
+    '''
+    generator._sample_flights(n_samples=100)  # populates generator.design_sell
+
+    mu_z = (generator.u_max_sel - generator.u_cargo_sel - generator.u_mail_sel
+        - generator.u_pax_sel * generator.proc.mu_pax)
+    print("z_T100 (nominal slack) range:", mu_z.min(), mu_z.max(), "median:", np.median(mu_z))
+
+    for theta_i in [prior.sample((1,))[0].numpy() for _ in range(3)]:
+        generator._set_hyperprior_from_theta(theta_i)
+        a, b = generator._alpha_beta(generator.design_sell)
+        eps_sample = generator.rng.gamma(a, b)
+        print("eps range:", eps_sample.min(), eps_sample.max(), "median:", np.median(eps_sample))
+
+    # sys.exit(0)
+
+    design_matr = generator.design_sell
+    for _ in range(5):
+        theta_i = prior.sample((1,))[0].numpy()
+        generator._set_hyperprior_from_theta(theta_i)
+        a, b = generator._alpha_beta(design_matr)
+        print("alpha range:", a.min(), a.max(), "| beta range:", b.min(), b.max())
+
+    for _ in range(5):
+        theta_i = prior.sample((1,))[0]
+        x_i = simulator(theta_i)  # simulator() itself calls _sample_flights(100) internally
+        S_col = x_i[:, -1]
+        print("S=1 fraction:", S_col.mean().item())
+
+    sys.exit(0)
+    '''
 
     # single_trial_embedding = EmbeddingNet(
     #     categorical_sizes=generator.proc.cat_sizes,
@@ -475,14 +581,14 @@ if __name__ == "__main__":
     neural_posterior = posterior_nn(
         model="maf",
         embedding_net=embedding_net,
-        hidden_features=min(generator.n_design, 64),  # was n_design*2
-        num_transforms=3,  # was 5
+        hidden_features=min(generator.n_design, 256),  # was n_design*2
+        num_transforms=5,  # was 5
         z_score_x='none',
         z_score_theta='none'
     )
 
     # breakpoint()  # enable interactive debugging when needed
-    inference = NPE(prior, density_estimator=neural_posterior, device="cpu")
+    inference = NPE(prior, density_estimator=neural_posterior, device=device)
 
     x_o = generator.observation()
 
@@ -491,26 +597,117 @@ if __name__ == "__main__":
 
     # breakpoint()  # enable interactive debugging when needed
 
-    theta, x = simulate_for_sbi(
-        simulator,
-        prior,
-        num_simulations=10000,
-        simulation_batch_size=1,
-        seed=generator.config.seed,
-    )
+    # Cheap pre-flight checks — abort early if something's structurally wrong
+    assert x_o.dtype == torch.float32, f"x_o dtype wrong: {x_o.dtype}"
+    assert not torch.isnan(x_o).any(), "x_o contains NaNs"
+    theta_probe, x_probe = simulate_for_sbi(simulator, prior, num_simulations=20, simulation_batch_size=1, seed=0)
+    assert not torch.isnan(x_probe).any(), "simulator produced NaNs"
+    print("S=1 fraction (probe):", x_probe[:, :, -1].mean().item())
+    print("theta probe std:", theta_probe.std(dim=0)[:5])
 
-    density_estimator = inference.append_simulations(theta, x).train(show_train_summary=True) # set max epochs here
+    generator._sample_flights(n_samples=40)  # match your actual n_flights per sim
+    mu_z = (generator.u_max_sel - generator.u_cargo_sel - generator.u_mail_sel
+            - generator.u_pax_sel * generator.proc.mu_pax)
+    print("z_T100 median:", np.median(mu_z))
 
-    posterior = inference.build_posterior(density_estimator)
-    posterior.set_default_x(x_o)
+    eps_medians = []
+    for _ in range(10):
+        theta_i = prior.sample((1,))[0].cpu().numpy()
+        generator._set_hyperprior_from_theta(theta_i)
+        a, b = generator._alpha_beta(generator.design_sell)
+        eps_sample = generator.rng.gamma(a, b) * 1e4  # match your scaling_factor
+        eps_medians.append(np.median(eps_sample))
+
+    print("eps median range across theta draws:", min(eps_medians), max(eps_medians))
+    print("z_T100 median for comparison:", np.median(mu_z))
+    # sanity: eps medians should span a meaningful fraction of z_T100's scale,
+    # not be uniformly tiny or uniformly huge relative to it
+
+    num_rounds = 1
+    posteriors = []
+    proposal = prior  # Use the prior as the initial proposal distribution
+
+    for _ in range(num_rounds):
+        theta, x = simulate_for_sbi(
+            simulator,
+            prior,
+            num_simulations=10_000,
+            simulation_batch_size=1,
+            seed=generator.config.seed,
+        )
+
+        # theta = theta.to(device)
+        # x = x.to(device)
+
+        density_estimator = inference.append_simulations(theta, x, proposal=proposal, data_device='cpu').train(show_train_summary=True, training_batch_size=512) # set max epochs here
+
+        posterior = inference.build_posterior(density_estimator)
+
+        posteriors.append(posterior)
+
+        proposal = posterior.set_default_x(x_o)
+
+        print("Fraction S=1 in synthetic training x:", x[:, :, -1].mean().item())
+
+        # ============================================================
+        # DIAGNOSTICS BLOCK
+        # ============================================================
+        run_dir = pathlib.Path("run_outputs") / f"run_{generator.config.seed}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+
+        # persist artifacts
+        torch.save(density_estimator.state_dict(), run_dir / "density_estimator.pt")
+        torch.save({"theta": theta.cpu(), "x": x.cpu()}, run_dir / "training_data.pt")
+        with open(run_dir / "training_summary.json", "w") as f:
+            json.dump({k: v for k, v in inference.summary.items()}, f, default=str)
+
+        diagnostics = {}
+        diagnostics["S_fraction_train"] = x[:, :, -1].mean().item()
+
+        theta_test = prior.sample((1,))
+        x_test = simulator(theta_test[0]).to(device)
+        post_test = posterior.sample((2000,), x=x_test).detach().cpu()
+        prior_samp = prior.sample((2000,)).cpu()
+        diagnostics["contraction_ratio"] = (post_test.std(dim=0) / prior_samp.std(dim=0))[:10].tolist()
+
+        samples_xo = posterior.sample((2000,), x=x_o).detach().cpu()
+        diagnostics["posterior_std_xo"] = samples_xo.std(dim=0)[:10].tolist()
+        diagnostics["posterior_mean_xo"] = samples_xo.mean(dim=0)[:10].tolist()
+
+        diagnostics["z_gen_stats"] = {
+            "median": float(np.median(generator.z_gen_sel)),
+            "frac_zero": float((generator.z_gen_sel == 0).mean()),
+        }
+
+        with open(run_dir / "diagnostics.json", "w") as f:
+            json.dump(diagnostics, f, indent=2)
+
+        theta_sbc, x_sbc = simulate_for_sbi(simulator, prior, num_simulations=300,
+                                              simulation_batch_size=1, seed=123)
+        ranks, _ = run_sbc(theta_sbc, x_sbc.to(device), posterior, num_posterior_samples=1000)
+        fig, ax = sbc_rank_plot(ranks, num_posterior_samples=1000, num_bins=20)
+        fig.savefig(run_dir / "sbc_rank_plot.png", dpi=150)
+        plt.close(fig)
+
     print("Posterior ready for conditioning on x_o with shape:", tuple(x_o.shape))
+
+    print(inference.summary["training_loss"])
+    print(inference.summary["validation_loss"])
+
+    fig, ax = plt.subplots()
+    ax.plot(inference.summary["training_loss"], label="train")
+    ax.plot(inference.summary["validation_loss"], label="val")
+    ax.set_xlabel("epoch"); ax.set_ylabel("loss"); ax.legend()
+    fig.savefig("loss_curve.png", dpi=150)
+
+    print("Saved to loss_curve.png")
 
     # posterior_samples = posterior.sample((1,), x=x_o)
     # breakpoint()  # enable interactive debugging when needed
-    from sbi.analysis import pairplot
-    import matplotlib.pyplot as plt
 
-    samples = posterior.sample((2000,), x=x_o)
+    samples = posterior.sample((2_000,), x=x_o).detach().cpu()
+    print("posterior std (34 overlapping rows only):", samples.std(dim=0)[:5])
+    print("posterior mean (34 overlapping rows only):", samples.mean(dim=0)[:5])
 
     subset = [0, 1, 2]
     std = 3.0  # match your MVN prior's std
@@ -525,3 +722,9 @@ if __name__ == "__main__":
 
     fig.savefig("pairplot.png", dpi=150)
     print("Saved to pairplot.png")
+
+    theta_test = prior.sample((1,))
+    x_test = simulator(theta_test[0])  # in-distribution, has real simulator's S mix
+    post_test = posterior.sample((2_000,), x=x_test.to(device)).detach().cpu()
+    print("posterior std (in-dist x):", post_test.std(dim=0)[:5])
+    print("prior std:", prior.sample((2_000,)).std(dim=0)[:5])
