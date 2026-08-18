@@ -243,7 +243,7 @@ class DataProcessing:
         header_row = df_raw.row(1)
         rename_map = {f"column_{i+1}": name for i, name in enumerate(header_row) if name}
         
-        exclude_types = ["Trucking", "Multimodal", "Ocean Freight"]
+        exclude_types = ["Trucking", "Multimodal", "Ocean Freight", "Freighter"]
         df_final = (
             df_clean
             .rename(rename_map)
@@ -530,10 +530,11 @@ class T100DataProcessing(DataProcessing):
 
         df = self._canonicalize_route_columns(df)
 
+        # TODO: create buckets discerning cargo and pax flts
         df_clean = (df.filter(
             (pl.col("DEPARTURES_PERFORMED") > 0) &
             (pl.col("DEPARTURES_SCHEDULED") > 0) &
-            (pl.col("CLASS").is_in(["A", "C", "E", "F"]))
+            (pl.col("CLASS").is_in(["A", "C", "E", "F", "G"]))
             ).sort(by="FREIGHT", descending=True)
         )
 
