@@ -1,4 +1,5 @@
 # %%
+import sys
 import warnings
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -60,6 +61,7 @@ class FeatureConfig:
 class DataProcessing:
     def __init__(self, feature_config: FeatureConfig | None = None, separate_target: bool = False):
         self.data_dir = Path(__file__).resolve().parent.parent
+        self.max_dist = 20_000
         self.excel_path = Path(self.data_dir, "data/Airlink - UMichiagn - Data Collection - 9.8.2025.xlsx")
         self.mapping = {}
         self.airports = ad.load('IATA')
@@ -176,7 +178,24 @@ class DataProcessing:
         ret =  df.with_columns((c * R).alias("DISTANCE"))
 
         return ret
-        
+
+    def _to_unit_cartesian(self, df: pl.DataFrame) -> pl.DataFrame:
+        ox = (pl.col("Origin_Lon").radians().cos() * pl.col("Origin_Lat").radians().cos()).alias("OX")
+        oy = (pl.col("Origin_Lon").radians().sin() * pl.col("Origin_Lat").radians().cos()).alias("OY")
+        oz = pl.col("Origin_Lat").radians().sin().alias("OZ")
+
+        dx = (pl.col("Destination_Lon").radians().cos() * pl.col("Destination_Lat").radians().cos()).alias("DX")
+        dy = (pl.col("Destination_Lon").radians().sin() * pl.col("Destination_Lat").radians().cos()).alias("DY")
+        dz = pl.col("Destination_Lat").radians().sin().alias("DZ")
+
+        normalized_dist = (pl.col("DISTANCE") / self.max_dist).alias("DISTANCE_NORM")
+
+        return df.with_columns([
+            ox, oy, oz,
+            dx, dy, dz,
+            normalized_dist
+        ]), ["OX", "OY", "OZ", "DX", "DY", "DZ", "DISTANCE_NORM"]
+
     def count_od_overlap(self, shipping_df: pl.DataFrame, t100_df: pl.DataFrame) -> int:
         """Counts how many unique origin-destination pairs in shipping data are present in t100 data."""
         overlap_df = self.get_od_overlap(shipping_df, t100_df)
@@ -233,6 +252,7 @@ class DataProcessing:
                 pl.col("Aircraft Type").is_not_null()
                 & (pl.col("Aircraft Type").str.strip_chars() != "")
                 & ~pl.col("Aircraft Type").is_in(exclude_types)
+                & (pl.col('AW (kg)') != "0")
             )
         )
 
@@ -385,7 +405,6 @@ class DataProcessing:
         return df
 
 
-
     def _normalize_data(self, data_tensor: torch.Tensor, is_training: bool ) -> torch.Tensor:
         if is_training:
             self.feature_mean = data_tensor.mean(dim=0)
@@ -400,8 +419,7 @@ class DataProcessing:
 
         return data_tensor
 
-    
-    def to_tensor(self, df: pl.DataFrame, is_training: bool = True, simple: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
+    def to_tensor(self, df: pl.DataFrame, is_training: bool = True, simple: bool = False, just_num: bool = False, normalize_and_convert: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
         warnings.warn('Ensure revised implementation to handle split num and cat tensors')
         
         data_ = self._encode_features(df, is_training=is_training)
@@ -415,12 +433,12 @@ class DataProcessing:
 
         self.num_cols = [c for c in self.features.numerical_features if c in data_.columns]
         num_tensor = torch.empty((data_.shape[0], 0), dtype=torch.float32)
-        if self.num_cols:    
+        if self.num_cols and normalize_and_convert:
+            converted, unit_cols = self._to_unit_cartesian(data_)
+            num_tensor = torch.tensor(converted.select(unit_cols).to_numpy().astype(np.float32), dtype=torch.float32)
+        elif self.num_cols and not normalize_and_convert:    
             input_tensor = torch.tensor(data_.select(self.num_cols).to_numpy().astype(np.float32), dtype=torch.float32)
-        # # Normalize data for ease of training
-        # # TODO do normalization elsewhere to prevent data leakage and ensure correct handling of new data
             # num_tensor = self._normalize_data(input_tensor, is_training=is_training)
-            # NOTE normalization will be handleded in model training pipeline
             num_tensor = input_tensor
 
         target_tensor = None
@@ -429,7 +447,9 @@ class DataProcessing:
             target_tensor = torch.tensor(target_array, dtype=torch.float64)
         # torch.tensor(data_.select(self.features.target_column).to_numpy().astype(np.int64))
         # breakpoint()
-        if simple:
+        if simple and just_num:
+            return num_tensor, target_tensor
+        elif simple and not just_num:
             # combine cat and num
             data_tensor = torch.cat([cat_tensor, num_tensor], dim=1)
             return data_tensor, target_tensor
@@ -512,6 +532,7 @@ class T100DataProcessing(DataProcessing):
 
         df_clean = (df.filter(
             (pl.col("DEPARTURES_PERFORMED") > 0) &
+            (pl.col("DEPARTURES_SCHEDULED") > 0) &
             (pl.col("CLASS").is_in(["A", "C", "E", "F"]))
             ).sort(by="FREIGHT", descending=True)
         )
@@ -521,33 +542,45 @@ class T100DataProcessing(DataProcessing):
         #     "DEST": "Destination",
         # })
 
-        df_normalized = df_clean.with_columns([
+        df_per_flt = df_clean.with_columns([
             (pl.col("PAYLOAD") / pl.col("DEPARTURES_PERFORMED")).alias("PAYLOAD_PER_FLIGHT"),
             (pl.col("FREIGHT") / pl.col("DEPARTURES_PERFORMED")).alias("FREIGHT_PER_FLIGHT"),
             (pl.col("MAIL") / pl.col("DEPARTURES_PERFORMED")).alias("MAIL_PER_FLIGHT"),
             (pl.col("PASSENGERS") / pl.col("DEPARTURES_PERFORMED")).alias("PASSENGERS_PER_FLIGHT")
         ])
 
+        # NOTE for the time being we just average to a single value per route
+        df_per_flt = df_per_flt.group_by(["ORIGIN", "DEST"]).agg([
+            pl.mean("PAYLOAD_PER_FLIGHT").alias("PAYLOAD_PER_FLIGHT"),
+            pl.mean("FREIGHT_PER_FLIGHT").alias("FREIGHT_PER_FLIGHT"),
+            pl.mean("MAIL_PER_FLIGHT").alias("MAIL_PER_FLIGHT"),
+            pl.mean("PASSENGERS_PER_FLIGHT").alias("PASSENGERS_PER_FLIGHT"),
+            pl.mean("DEPARTURES_PERFORMED").alias("DEPARTURES_PERFORMED"),
+            pl.mean("DEPARTURES_SCHEDULED").alias("DEPARTURES_SCHEDULED"),
+        ])
+
         # NOTE currently sweeps and eliminates routes with 0 departures whatsoever, 
         # while assumed to be fine for now, may need to shift to a mask instead to 
         # maintain dataset integrity
 
-        u_max = df_normalized["PAYLOAD_PER_FLIGHT"].cast(pl.Float32).to_numpy()
-        u_cargo = df_normalized["FREIGHT_PER_FLIGHT"].cast(pl.Float32).to_numpy()
-        u_mail = df_normalized["MAIL_PER_FLIGHT"].cast(pl.Float32).to_numpy()
-        u_pax = df_normalized["PASSENGERS_PER_FLIGHT"].cast(pl.Float32).to_numpy()
+        u_max = df_per_flt["PAYLOAD_PER_FLIGHT"].cast(pl.Float32).to_numpy()
+        u_cargo = df_per_flt["FREIGHT_PER_FLIGHT"].cast(pl.Float32).to_numpy()
+        u_mail = df_per_flt["MAIL_PER_FLIGHT"].cast(pl.Float32).to_numpy()
+        u_pax = df_per_flt["PASSENGERS_PER_FLIGHT"].cast(pl.Float32).to_numpy()
 
         # Calcuate the distributions
-        mu_z = u_max - (u_cargo + u_mail + (self.mu_pax * u_pax))
-        sigma_z = np.sqrt(np.maximum(u_pax, 0.0)) * self.sigma_pax
+        self.mu_z = u_max - (u_cargo + u_mail + (self.mu_pax * u_pax))
+        self.sigma_z = np.sqrt(np.maximum(u_pax, 0.0)) * self.sigma_pax
 
         # Generate truncated slack samples
-        slack_samples = self._truncated_slack_samples(mu_z, sigma_z, n_draws=100)
+        slack_samples = self._truncated_slack_samples(self.mu_z, self.sigma_z, n_draws=100)
         expected_slack = np.mean(slack_samples, axis=1)
 
-        df_final = df_normalized.with_columns([
+        df_final = df_per_flt.with_columns([
             (pl.Series("SLACK_ARRAY", slack_samples)),
-            (pl.Series("SLACK", expected_slack, dtype=pl.Float32))
+            (pl.Series("SLACK", expected_slack, dtype=pl.Float32)),
+            (pl.Series("MU_SLACK", self.mu_z, dtype=pl.Float32)),
+            (pl.Series("SIGMA_SLACK", self.sigma_z, dtype=pl.Float32))
         ])
 
         return df_final
@@ -591,6 +624,11 @@ if __name__ == "__main__":
     # T100DataProcessing has the data loaded in self.t100_data, 
     # or you can use filter_data() to get the cleaned version
     df_t100 = t100_processor.filter_data()
+    df_t100_geo = t100_processor._geolocate_nodes(df_t100)
+    df_t100_dist = t100_processor._calculate_distance(df_t100_geo)
+
+    normalized_tensor_test, _ = t100_processor.to_tensor(df_t100_dist, is_training=True, simple=True, just_num=True, normalize_and_convert=True)
+    print(normalized_tensor_test)
 
     # 4. Count the overlap
     overlap_count = dp.count_od_overlap(df_shipping, df_t100)
