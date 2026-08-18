@@ -100,62 +100,62 @@ class SyntheticDataGenerator:
     #  Loading / preprocessing
     # -------------------------------------------------------------------
 
-
-    def _get_nominal_slack(self, n_samples: int = 1) -> np.ndarray:
-        """Calculate the nominal slack (before draw-down) for a random subset of flights."""
-        # Sample flights to get the baseline slack
-        self._sample_flights(n_samples=n_samples)
-        mu_z = (
-            self.u_max_sel
-            - self.u_cargo_sel
-            - self.u_mail_sel
-            - (self.u_pax_sel * self.proc.mu_pax)
-        )
-        sigma_z = np.sqrt(np.maximum(self.u_pax_sel, 0.0)) * self.proc.sigma_pax
-        return self.proc._truncated_slack_samples(
-            mu_z, sigma_z, n_draws=1
-        ).reshape(-1).astype(np.float32)
-
     def _augment_shipping_data(self, max_rows: int = 100, num_rows: int = 100) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if max_rows > len(self.ship_dist):
+            max_rows = len(self.ship_dist)
+            num_rows = len(self.ship_dist)
+
+        if max_rows % 5 != 0:
+            max_rows = (max_rows // 5) * 5  # round down to nearest multiple of 5
+            num_rows = (num_rows // 5) * 5  # round down to nearest multiple of 5
+
         # Create a local copy of shipping data to prevent overwriting the class attribute
         aug_ship_dist = self.ship_dist[:max_rows].clone()
         aug_ship_dist = aug_ship_dist.with_columns(pl.col("AW (kg)").cast(pl.Float64))
 
-        # Since observation() is called early, z_gen_sel might not exist.
-        # We generate nominal slack samples specifically for augmentation.
-        # We need enough slack samples to cover the shipping data selection.
-        z_nominal = self._get_nominal_slack(n_samples=len(aug_ship_dist))
-
-        # take the shipping dist and add a set of new rows identical to the 
-        # existing rows with the main difference being that the weight will be greater than or equal 
-        # to the slack value for that observation setting S = 1 for that row 
+        aug_obs_ship_tens = self.observed_ship_tensor[:max_rows].clone()
+        aug_obs_weight_tens = self.observed_weight_tensor[:max_rows].clone()
 
         for _ in range(num_rows):
             # randomly select a row from the shipping data
-            idx = self.rng.choice(len(aug_ship_dist))
-            row = aug_ship_dist[idx]
+            idx = self.rng.choice(max_rows)
+            df_row = aug_ship_dist[idx]
+
+            tens_row = aug_obs_ship_tens[idx]
+            tens_weight = aug_obs_weight_tens[idx]
+
+            match = self.t100_df.filter((pl.col("ORIGIN") == df_row["ORIGIN"]) & (pl.col("DEST") == df_row["DEST"]))
+            assert len(match) == 1, f"got {match} matches for {df_row['ORIGIN']} -> {df_row['DEST']}, expected 1"
 
             # create a new row with the same values but with a weight greater than or equal to the slack value
-            new_row = row.clone()
+            new_row = df_row.clone()
             # new_row is a Series, so we access the value using .item() or [0]
             weight_val = float(new_row["AW (kg)"][0])
-            slack_val = float(z_nominal[idx % len(z_nominal)])
+            slack_val = match['SLACK'].item()
+
+            assert weight_val <= slack_val, breakpoint()# f"weight_val={weight_val} is greater than slack_val={slack_val} for {df_row['ORIGIN']} -> {df_row['DEST']}"
+            new_weight = slack_val - 1e3
+            assert new_weight >= 0, f"new_weight={new_weight} is negative for slack_val={slack_val}"
+            assert new_weight >= weight_val, f"new_weight={new_weight} is less than original weight_val={weight_val}"
 
             # new_row = new_row.with_columns(pl.lit(max(weight_val, slack_val - 3e3)).alias("AW (kg)"))
-            new_row = new_row.with_columns(pl.lit(weight_val + 1e1).alias("AW (kg)"))
+            new_row = new_row.with_columns(pl.lit(new_weight).alias("AW (kg)"))
             # append the new row to the local augmented dataframe
             aug_ship_dist = aug_ship_dist.vstack(new_row)
 
+            # append the new tensor row to the local augmented tensor
+            aug_obs_ship_tens = torch.cat([aug_obs_ship_tens, tens_row.unsqueeze(0)], dim=0)
+            aug_obs_weight_tens = torch.cat([aug_obs_weight_tens, torch.tensor([[new_weight]], dtype=torch.float32)], dim=0)
+
         # Derive U and W from the local augmented dataframe, sampled to max_rows
-        U = torch.tensor(self._apply_one_hot_mapping(aug_ship_dist[:(max_rows + num_rows)]), dtype=torch.float32)
-        W = torch.tensor(aug_ship_dist[:(max_rows + num_rows)]["AW (kg)"].to_numpy(), dtype=torch.float32).unsqueeze(1)
+        # U = torch.tensor(self._apply_one_hot_mapping(aug_ship_dist[:(max_rows + num_rows)]), dtype=torch.float32)
+        # NOTE we add 2 manually to account for the conversion to OD XYZ from OD lat-lon
+        U = aug_obs_ship_tens[:(max_rows + num_rows)]
+        W = aug_obs_weight_tens[:(max_rows + num_rows)].to(torch.float32)
         
         # S = 1 for the original rows and 0 for the augmented rows
-        # NOTE bootleg fix
-        orig_count = len(self.observed_weight_tensor[:max_rows])
-        s_labels = [1.0 if i < orig_count else 0.0 for i in range(max_rows + num_rows)]
+        s_labels = [1.0 if i < max_rows else 0.0 for i in range(max_rows + num_rows)]
         S = torch.tensor(s_labels, dtype=torch.float32).unsqueeze(1)
-
         return U, W, S
 
     def _load_shipping_data(self) -> None:
@@ -166,11 +166,13 @@ class SyntheticDataGenerator:
         ship_geo = self.shipping_proc._geolocate_nodes(df_shipping)
         ship_dist = self.shipping_proc._calculate_distance(ship_geo)
 
-        self.ship_dist = self.shipping_proc.get_od_overlap(ship_dist, self.df)
+        self.ship_dist = self.shipping_proc.get_od_overlap(ship_dist, self.t100_df)
 
         self.observed_ship_tensor, self.observed_weight_tensor = self.shipping_proc.to_tensor(
-            self.ship_dist, is_training=False, simple=True
+            self.ship_dist, is_training=False, simple=True, just_num=True, normalize_and_convert=True
         )
+
+        print(f"Observed shipping tensor shape: {self.observed_ship_tensor.shape}, {self.observed_weight_tensor.shape}")
 
     def _load_and_preprocess(self) -> None:
         """Load the T100 data, clean it, and compute the feature tensor."""
@@ -178,21 +180,23 @@ class SyntheticDataGenerator:
         df = df.filter(pl.col("SLACK").is_not_null()).filter(~pl.col("SLACK").is_nan())
 
         # Persist the per‑flight scalar columns – they are needed during synthesis.
-        self.u_max_all = df["PAYLOAD_PER_FLIGHT"].to_numpy().astype(np.float32)
-        self.u_cargo_all = df["FREIGHT_PER_FLIGHT"].to_numpy().astype(np.float32)
-        self.u_mail_all = df["MAIL_PER_FLIGHT"].to_numpy().astype(np.float32)
-        self.u_pax_all = df["PASSENGERS_PER_FLIGHT"].to_numpy().astype(np.float32)
+        # self.u_max_all = df["PAYLOAD_PER_FLIGHT"].to_numpy().astype(np.float32)
+        # self.u_cargo_all = df["FREIGHT_PER_FLIGHT"].to_numpy().astype(np.float32)
+        # self.u_mail_all = df["MAIL_PER_FLIGHT"].to_numpy().astype(np.float32)
+        # self.u_pax_all = df["PASSENGERS_PER_FLIGHT"].to_numpy().astype(np.float32)
 
         # Geolocate nodes, compute distances, and encode all features into a
         # single numerical tensor.
         df_geo = self.proc._geolocate_nodes(df)
-        df_dist = self.proc._calculate_distance(df_geo)
+        self.t100_df = self.proc._calculate_distance(df_geo)
+
+        self.mu_z = self.t100_df["MU_SLACK"].to_numpy().astype(np.float32)
+        self.sigma_z = self.t100_df["SIGMA_SLACK"].to_numpy().astype(np.float32)
 
         self.features_tensor, _ = self.proc.to_tensor(
-            df_dist, is_training=True, simple=True
+            self.t100_df, is_training=True, simple=True, just_num=True, normalize_and_convert=True
         )
         self.X_full = self.features_tensor.detach().cpu().numpy().astype(np.float32)
-        self.df = df_dist
 
         self.n_features = self.X_full.shape[1]
 
@@ -210,10 +214,11 @@ class SyntheticDataGenerator:
         idx = self.rng.choice(total, size=n_samples, replace=False)
         self.idx = idx
         self.X_sel = self.X_full[idx]
-        self.u_max_sel = self.u_max_all[idx]
-        self.u_cargo_sel = self.u_cargo_all[idx]
-        self.u_mail_sel = self.u_mail_all[idx]
-        self.u_pax_sel = self.u_pax_all[idx]
+
+        # self.u_max_sel = self.u_max_all[idx]
+        # self.u_cargo_sel = self.u_cargo_all[idx]
+        # self.u_mail_sel = self.u_mail_all[idx]
+        # self.u_pax_sel = self.u_pax_all[idx]
 
         self.design_sell = self.design_full[idx]
 
@@ -222,20 +227,22 @@ class SyntheticDataGenerator:
     # -------------------------------------------------------------------
     
     def _epsilon_design_matr(self) -> None:
-        categorical_cols = FeatureConfig().categorical_features
-        numeric_cols = FeatureConfig().numerical_features
-
-        dummies = self.df.select(categorical_cols).to_dummies()
-        self.dummy_cols = dummies.columns
-
-        numeric = self.df.select(numeric_cols).to_numpy().astype(np.float32)
-        self.num_mean = numeric.mean(axis=0, keepdims=True)
-        self.num_std = numeric.std(axis=0, keepdims=True) + 1e-6
-
-        num_std_scaled = (numeric - self.num_mean) / (self.num_std)
-
-        self.design_full = np.concatenate([dummies.to_numpy().astype(np.float32), num_std_scaled], axis=1)
+        self.design_full = self.X_full
         self.n_design = self.design_full.shape[1]
+        # categorical_cols = FeatureConfig().categorical_features
+        # numeric_cols = FeatureConfig().numerical_features
+
+        # dummies = self.df.select(categorical_cols).to_dummies()
+        # self.dummy_cols = dummies.columns
+
+        # numeric = self.df.select(numeric_cols).to_numpy().astype(np.float32)
+        # self.num_mean = numeric.mean(axis=0, keepdims=True)
+        # self.num_std = numeric.std(axis=0, keepdims=True) + 1e-6
+
+        # num_std_scaled = (numeric - self.num_mean) / (self.num_std)
+
+        # self.design_full = np.concatenate([dummies.to_numpy().astype(np.float32), num_std_scaled], axis=1)
+        # self.n_design = self.design_full.shape[1]
         
     def _draw_hyperprior_coeffs(self) -> None:
         """Draw hyperprior coefficients for the gamma distribution."""
@@ -261,11 +268,11 @@ class SyntheticDataGenerator:
         log_beta  = (design_matr @ self.psi_beta)  / np.sqrt(self.n_design)
         return np.exp(log_alpha), np.exp(log_beta)
 
-    def _draw_down(self, design_matr: np.ndarray) -> np.ndarray:
-        scaling_factor = 1e4
+    def _draw_down(self, design_matr: np.ndarray, mu_z: np.ndarray) -> np.ndarray:
+        scaling_factors = mu_z
 
         alpha_i, beta_i = self._alpha_beta(design_matr)
-        return (self.rng.gamma(alpha_i, beta_i) * scaling_factor).astype(np.float32)
+        return (self.rng.gamma(alpha_i, beta_i) * scaling_factors).astype(np.float32)
 
     def _standardize_features(self) -> None:
         self.X_mean = self.X_full.mean(axis=0, keepdims=True)
@@ -274,13 +281,9 @@ class SyntheticDataGenerator:
 
     def _generate_slack_samples(self) -> None:
         """Create truncated‑normal slack (U) samples for the selected flights."""
-        mu_z = (
-            self.u_max_sel
-            - self.u_cargo_sel
-            - self.u_mail_sel
-            - (self.u_pax_sel * self.proc.mu_pax)
-        )
-        sigma_z = np.sqrt(np.maximum(self.u_pax_sel, 0.0)) * self.proc.sigma_pax
+        mu_z = self.mu_z[self.idx]
+        sigma_z = self.sigma_z[self.idx]
+
         self.z_gen_sel = self.proc._truncated_slack_samples(
             mu_z, sigma_z, n_draws=1
         ).reshape(-1).astype(np.float32)  # Subtract the drawn down values
@@ -290,7 +293,7 @@ class SyntheticDataGenerator:
         # self._epsilon_design_matr()
         # self.design_sell = self.design_full[self.idx]
         # self._draw_hyperprior_coeffs()
-        eps = self._draw_down(self.design_sell)
+        eps = self._draw_down(self.design_sell, mu_z)
         # ensure non-negative slack values
         self.z_gen_sel = np.maximum(self.z_gen_sel - eps, 0.0).astype(np.float32)
         # breakpoint()  # enable interactive debugging when needed
@@ -302,6 +305,7 @@ class SyntheticDataGenerator:
     def _weight_dist(self) -> None:
         x = self.ship_dist["AW (kg)"].cast(pl.Float64).drop_nulls().to_numpy()
         x = x[x > 0]  # Remove zeros for log-normal fitting
+        self.max_weight = x.max()
 
         self.weight_dist_shape, self.weight_dist_loc, self.weight_dist_scale = lognorm.fit(x, floc=0)
 
@@ -321,9 +325,11 @@ class SyntheticDataGenerator:
 
     def _weight_sweep(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         U, W, S = [], [], []
-        for u_vec, z_gen in zip(self.design_sell, self.z_gen_sel):
-            w_s = self._sample_weight(self.config.k_swaps)
+        w_s = np.array([1e2, 1e3, 3e3, 1e4, 3e4])
 
+        for u_vec, z_gen in zip(self.design_sell, self.z_gen_sel):
+            # w_s = self._sample_weight(self.config.k_swaps)
+            # Standardize the analyzed weights
             s = (w_s <= z_gen).astype(np.float32)
             # breakpoint()  # enable interactive debugging when needed
             U.append(np.repeat(u_vec[np.newaxis, :], self.config.k_swaps, axis=0))
@@ -351,7 +357,7 @@ class SyntheticDataGenerator:
 
         if theta.ndim == 1:
             # 1. Redraw a new set of 100 flights for this simulation
-            self._sample_flights(n_samples=40)
+            self._sample_flights(n_samples=34)
 
             # 1.5 Update the design matrix for the selected flights
             # self.design_sell = self.design_full[self.idx]
@@ -403,7 +409,7 @@ class SyntheticDataGenerator:
         # S = torch.ones_like(W)  # all weights are valid for the observation
 
         # print(f"U dtype: {U.dtype}, W dtype: {W.dtype}, S dtype: {S.dtype}")
-        U, S, W = self._augment_shipping_data(max_rows=max_rows, num_rows=100)
+        U, W, S = self._augment_shipping_data(max_rows=max_rows, num_rows=100)
 
         return torch.cat([U, W, S], dim=1).to(self.device)
 
@@ -501,6 +507,7 @@ def _demo() -> None:
     generator.print_sample()
     # breakpoint() # enable interactive debugging when needed
 
+
 import optuna
 def objective(trial: optuna.Trial):
     pass
@@ -523,10 +530,10 @@ if __name__ == "__main__":
     #     low=-2 * torch.ones(2 * generator.n_design),
     #     high=2 * torch.ones(2 * generator.n_design),
     # )
-
+    std = 1.0
     prior = MultivariateNormal(
         loc=torch.zeros(2 * generator.n_design, device=device),
-        covariance_matrix=torch.eye(2 * generator.n_design, device=device) * 15.0**2,
+        covariance_matrix=torch.eye(2 * generator.n_design, device=device) * std,
     )
 
     simulator = generator.simulator
@@ -569,13 +576,13 @@ if __name__ == "__main__":
     # )
 
     single_trial_embedding = FCEmbedding(
-        668,
-        generator.n_design, # * 2,
+        generator.n_design + 2,# 668,
+        generator.n_design * 2,
     )
 
     embedding_net = PermutationInvariantEmbedding(
         single_trial_embedding,
-        generator.n_design, # * 2,
+        generator.n_design * 2,
     )
 
     neural_posterior = posterior_nn(
@@ -583,8 +590,8 @@ if __name__ == "__main__":
         embedding_net=embedding_net,
         hidden_features=min(generator.n_design, 256),  # was n_design*2
         num_transforms=5,  # was 5
-        z_score_x='none',
-        z_score_theta='none'
+        z_score_x='independent',
+        z_score_theta='independent',
     )
 
     # breakpoint()  # enable interactive debugging when needed
@@ -605,10 +612,10 @@ if __name__ == "__main__":
     print("S=1 fraction (probe):", x_probe[:, :, -1].mean().item())
     print("theta probe std:", theta_probe.std(dim=0)[:5])
 
-    generator._sample_flights(n_samples=40)  # match your actual n_flights per sim
-    mu_z = (generator.u_max_sel - generator.u_cargo_sel - generator.u_mail_sel
-            - generator.u_pax_sel * generator.proc.mu_pax)
-    print("z_T100 median:", np.median(mu_z))
+    # generator._sample_flights(n_samples=40)  # match your actual n_flights per sim
+    # mu_z = (generator.u_max_sel - generator.u_cargo_sel - generator.u_mail_sel
+    #         - generator.u_pax_sel * generator.proc.mu_pax)
+    # print("z_T100 median:", np.median(generator.mu_z))
 
     eps_medians = []
     for _ in range(10):
@@ -619,7 +626,7 @@ if __name__ == "__main__":
         eps_medians.append(np.median(eps_sample))
 
     print("eps median range across theta draws:", min(eps_medians), max(eps_medians))
-    print("z_T100 median for comparison:", np.median(mu_z))
+    # print("z_T100 median for comparison:", np.median(mu_z))
     # sanity: eps medians should span a meaningful fraction of z_T100's scale,
     # not be uniformly tiny or uniformly huge relative to it
 
@@ -631,7 +638,7 @@ if __name__ == "__main__":
         theta, x = simulate_for_sbi(
             simulator,
             prior,
-            num_simulations=10_000,
+            num_simulations=100_000,
             simulation_batch_size=1,
             seed=generator.config.seed,
         )
@@ -709,8 +716,7 @@ if __name__ == "__main__":
     print("posterior std (34 overlapping rows only):", samples.std(dim=0)[:5])
     print("posterior mean (34 overlapping rows only):", samples.mean(dim=0)[:5])
 
-    subset = [0, 1, 2]
-    std = 3.0  # match your MVN prior's std
+    subset = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
     n_bound = 4 * std
 
     fig, axes = pairplot(
