@@ -11,11 +11,13 @@ import polars as pl
 import torch
 from scipy.stats import truncnorm
 
+KG_TO_LB = 2.20462
+
 
 # %%
 @dataclass
 class FeatureConfig:
-    target_column: str = "AW (kg)" # default as realistically should only be used for shipping data
+    target_column: str = "AW (lbs)" # default as realistically should only be used for shipping data
 
     # standardized naming conventions
     categorical_features: list[str] = field(default_factory=lambda: [
@@ -256,6 +258,10 @@ class DataProcessing:
             )
         )
 
+        df_final = df_final.with_columns(
+            pl.col("AW (kg)").cast(pl.Float32) * KG_TO_LB
+        ).rename({"AW (kg)": "AW (lbs)"})
+        
         df_final = self._canonicalize_route_columns(df_final)
 
         # TODO in df final, check origin destination, if either is not in airports data, raise error with list of unknown codes
