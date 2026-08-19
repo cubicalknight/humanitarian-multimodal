@@ -111,7 +111,7 @@ class SyntheticDataGenerator:
 
         # Create a local copy of shipping data to prevent overwriting the class attribute
         aug_ship_dist = self.ship_dist[:max_rows].clone()
-        aug_ship_dist = aug_ship_dist.with_columns(pl.col("AW (kg)").cast(pl.Float64))
+        aug_ship_dist = aug_ship_dist.with_columns(pl.col("AW (lbs)").cast(pl.Float64))
 
         aug_obs_ship_tens = self.observed_ship_tensor[:max_rows].clone()
         aug_obs_weight_tens = self.observed_weight_tensor[:max_rows].clone()
@@ -130,7 +130,7 @@ class SyntheticDataGenerator:
             # create a new row with the same values but with a weight greater than or equal to the slack value
             new_row = df_row.clone()
             # new_row is a Series, so we access the value using .item() or [0]
-            weight_val = float(new_row["AW (kg)"][0])
+            weight_val = float(new_row["AW (lbs)"][0])
             slack_val = match['SLACK'].item()
 
             assert weight_val <= slack_val, breakpoint()# f"weight_val={weight_val} is greater than slack_val={slack_val} for {df_row['ORIGIN']} -> {df_row['DEST']}"
@@ -138,8 +138,8 @@ class SyntheticDataGenerator:
             assert new_weight >= 0, f"new_weight={new_weight} is negative for slack_val={slack_val}"
             assert new_weight >= weight_val, f"new_weight={new_weight} is less than original weight_val={weight_val}"
 
-            # new_row = new_row.with_columns(pl.lit(max(weight_val, slack_val - 3e3)).alias("AW (kg)"))
-            new_row = new_row.with_columns(pl.lit(new_weight).alias("AW (kg)"))
+            # new_row = new_row.with_columns(pl.lit(max(weight_val, slack_val - 3e3)).alias("AW (lbs)"))
+            new_row = new_row.with_columns(pl.lit(new_weight).alias("AW (lbs)"))
             # append the new row to the local augmented dataframe
             aug_ship_dist = aug_ship_dist.vstack(new_row)
 
@@ -296,14 +296,13 @@ class SyntheticDataGenerator:
         eps = self._draw_down(self.design_sell, mu_z)
         # ensure non-negative slack values
         self.z_gen_sel = np.maximum(self.z_gen_sel - eps, 0.0).astype(np.float32)
-        # breakpoint()  # enable interactive debugging when needed
 
     # -------------------------------------------------------------------
     #  Weight sweep
     # -------------------------------------------------------------------
 
     def _weight_dist(self) -> None:
-        x = self.ship_dist["AW (kg)"].cast(pl.Float64).drop_nulls().to_numpy()
+        x = self.ship_dist["AW (lbs)"].cast(pl.Float64).drop_nulls().to_numpy()
         x = x[x > 0]  # Remove zeros for log-normal fitting
         self.max_weight = x.max()
 
@@ -331,7 +330,7 @@ class SyntheticDataGenerator:
             # w_s = self._sample_weight(self.config.k_swaps)
             # Standardize the analyzed weights
             s = (w_s <= z_gen).astype(np.float32)
-            # breakpoint()  # enable interactive debugging when needed
+
             U.append(np.repeat(u_vec[np.newaxis, :], self.config.k_swaps, axis=0))
             W.append(w_s[:, np.newaxis])
             S.append(s[:, np.newaxis])
@@ -342,7 +341,6 @@ class SyntheticDataGenerator:
         U = torch.tensor(np.concatenate(U, axis=0), dtype=torch.float32)
         W = torch.tensor(np.concatenate(W, axis=0), dtype=torch.float32)
         S = torch.tensor(np.concatenate(S, axis=0), dtype=torch.float32)
-        # breakpoint()  # enable interactive debugging when needed
         return U, W, S
 
     # -------------------------------------------------------------------
@@ -384,7 +382,6 @@ class SyntheticDataGenerator:
         dummy_dat = dummies.to_numpy().astype(np.float32)
 
         final_dummies = np.zeros((len(df), len(self.dummy_cols)), dtype=np.float32)
-        # breakpoint()  # enable interactive debugging when needed
         # TODO: there are more cols in dummy_cols than in the current df, so we need to map them correctly, 
         # they still need to be added even if zero
         for col in dummies.columns:
@@ -392,7 +389,6 @@ class SyntheticDataGenerator:
                 idx = self.dummy_cols.index(col)
                 final_dummies[:, idx] = dummy_dat[:, dummies.columns.index(col)]
 
-        # breakpoint()  # enable interactive debugging when needed
         numeric = df.select(numerical_cols).to_numpy().astype(np.float32)
         num_std_scaled = (numeric - self.num_mean) / (self.num_std)
 
@@ -502,10 +498,8 @@ def _demo() -> None:
     cfg = SyntheticGeneratorConfig()
     generator = SyntheticDataGenerator(cfg)
     U, W, S = generator.generate()
-    # breakpoint()  # enable interactive debugging when needed
     generator.save()
     generator.print_sample()
-    # breakpoint() # enable interactive debugging when needed
 
 
 import optuna
@@ -522,8 +516,6 @@ if __name__ == "__main__":
     print("cat_sizes:", generator.proc.cat_sizes)
     print("actual max codes:", generator.X_full[:, :n_cats].max(axis=0))
     print("actual min codes:", generator.X_full[:, :n_cats].min(axis=0))
-
-    # breakpoint()  # enable interactive debugging when needed
 
     # Uniform prior over the range [-10, 10] for each of the 2 * n_design hyperprior coefficients
     # prior = sbi_utils.BoxUniform(
@@ -594,7 +586,6 @@ if __name__ == "__main__":
         z_score_theta='independent',
     )
 
-    # breakpoint()  # enable interactive debugging when needed
     inference = NPE(prior, density_estimator=neural_posterior, device=device)
 
     x_o = generator.observation()
@@ -602,7 +593,6 @@ if __name__ == "__main__":
     print("x_o dtype:", x_o.dtype)
     print("x_o shape:", x_o.shape)
 
-    # breakpoint()  # enable interactive debugging when needed
 
     # Cheap pre-flight checks — abort early if something's structurally wrong
     assert x_o.dtype == torch.float32, f"x_o dtype wrong: {x_o.dtype}"
@@ -710,7 +700,6 @@ if __name__ == "__main__":
     print("Saved to loss_curve.png")
 
     # posterior_samples = posterior.sample((1,), x=x_o)
-    # breakpoint()  # enable interactive debugging when needed
 
     samples = posterior.sample((2_000,), x=x_o).detach().cpu()
     print("posterior std (34 overlapping rows only):", samples.std(dim=0)[:5])
