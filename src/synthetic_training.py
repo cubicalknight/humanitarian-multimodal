@@ -1,14 +1,15 @@
 #!/usr/bin/env python
-import pathlib
-from dataclasses import dataclass
-import sys
+import datetime
 import json
+import os
+import pathlib
+import sys
+from dataclasses import dataclass
 
 import numpy as np
 import polars as pl
-
 import torch
-import torch.nn as nn
+from torch import nn
 from torch.distributions import MultivariateNormal
 
 torch.manual_seed(42)
@@ -16,18 +17,13 @@ np.random.seed(42)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
-from sbi.utils import BoxUniform
-from sbi.inference import NPE, simulate_for_sbi
-from sbi.neural_nets import posterior_nn
-from sbi.neural_nets.embedding_nets import (
-    FCEmbedding,
-    PermutationInvariantEmbedding
-)
+import matplotlib.pyplot as plt
 from sbi.analysis import pairplot, sbc_rank_plot
 from sbi.diagnostics import run_sbc
-
-import matplotlib.pyplot as plt
-
+from sbi.inference import NPE, simulate_for_sbi
+from sbi.neural_nets import posterior_nn
+from sbi.neural_nets.embedding_nets import FCEmbedding, PermutationInvariantEmbedding
+from sbi.utils import BoxUniform
 from scipy.stats import lognorm
 
 from data_processing import DataProcessing, FeatureConfig, T100DataProcessing
@@ -116,32 +112,67 @@ class SyntheticDataGenerator:
         aug_obs_ship_tens = self.observed_ship_tensor[:max_rows].clone()
         aug_obs_weight_tens = self.observed_weight_tensor[:max_rows].clone()
 
-        for _ in range(num_rows):
-            # randomly select a row from the shipping data
-            idx = self.rng.choice(max_rows)
-            df_row = aug_ship_dist[idx]
+        def sample_row(idx: int) -> tuple[pl.Series, torch.Tensor, float]:
+            df_row = self.ship_dist[idx].clone()
 
-            tens_row = aug_obs_ship_tens[idx]
-            tens_weight = aug_obs_weight_tens[idx]
+            tens_row = aug_obs_ship_tens[idx].clone()
 
             match = self.t100_df.filter((pl.col("ORIGIN") == df_row["ORIGIN"]) & (pl.col("DEST") == df_row["DEST"]))
             assert len(match) == 1, f"got {match} matches for {df_row['ORIGIN']} -> {df_row['DEST']}, expected 1"
 
-            # create a new row with the same values but with a weight greater than or equal to the slack value
-            new_row = df_row.clone()
-            # new_row is a Series, so we access the value using .item() or [0]
-            weight_val = float(new_row["AW (lbs)"][0])
+            weight_val = float(df_row["AW (lbs)"][0])
             slack_val = match['SLACK'].item()
 
-            assert weight_val <= slack_val, breakpoint()# f"weight_val={weight_val} is greater than slack_val={slack_val} for {df_row['ORIGIN']} -> {df_row['DEST']}"
-            new_weight = slack_val - 1e3
+            if weight_val > slack_val:
+                if df_row['ORIGIN'].item() not in ['ORD', 'JFK'] and df_row['DEST'].item() not in ['MUC', 'LHR']:
+                    raise Exception(f"weight_val={weight_val} is greater than slack_val={slack_val} for {df_row['ORIGIN']} -> {df_row['DEST']}")
+                else:
+                    print(f"weight_val={weight_val} is greater than slack_val={slack_val} for {df_row['ORIGIN']} -> {df_row['DEST']}")
+                    new_idx = self.rng.choice(len(self.ship_dist))
+                    print(f"Old index {idx} retrying with new index {new_idx}")
+                    return sample_row(new_idx)
+
+            new_weight = slack_val - 5e2
             assert new_weight >= 0, f"new_weight={new_weight} is negative for slack_val={slack_val}"
             assert new_weight >= weight_val, f"new_weight={new_weight} is less than original weight_val={weight_val}"
 
-            # new_row = new_row.with_columns(pl.lit(max(weight_val, slack_val - 3e3)).alias("AW (lbs)"))
-            new_row = new_row.with_columns(pl.lit(new_weight).alias("AW (lbs)"))
+            return df_row, tens_row, new_weight
+
+        idxs = self.rng.choice(len(self.ship_dist), size=num_rows, replace=False).tolist()
+        for idx in idxs:
+            # randomly select a row from the shipping data
+            # idx = self.rng.choice(max_rows)
+            df_row, tens_row, new_weight = sample_row(idx)
+
+            # df_row = aug_ship_dist[idx].clone()
+
+            # tens_row = aug_obs_ship_tens[idx].clone()
+            # tens_weight = aug_obs_weight_tens[idx].clone()
+
+            # match = self.t100_df.filter((pl.col("ORIGIN") == df_row["ORIGIN"]) & (pl.col("DEST") == df_row["DEST"]))
+            # assert len(match) == 1, f"got {match} matches for {df_row['ORIGIN']} -> {df_row['DEST']}, expected 1"
+
+            # create a new row with the same values but with a weight greater than or equal to the slack value
+            # df_row is a Series, so we access the value using .item() or [0]
+            # weight_val = float(df_row["AW (lbs)"][0])
+            # slack_val = match['SLACK'].item()
+
+            # assert weight_val <= slack_val and not df_row['ORIGIN'].item() != 'ORD' and not df_row['DEST'].item() != 'MUC', breakpoint()# f"weight_val={weight_val} is greater than slack_val={slack_val} for {df_row['ORIGIN']} -> {df_row['DEST']}"
+            # if weight_val > slack_val:
+            #     if df_row['ORIGIN'].item() not in ['ORD', 'JFK'] and df_row['DEST'].item() not in ['MUC', 'LHR']:
+            #         breakpoint()
+            #     else:
+            #         print(f"weight_val={weight_val} is greater than slack_val={slack_val} for {df_row['ORIGIN']} -> {df_row['DEST']}")
+            #         num_rows -= 1
+            #         continue
+            # new_weight = slack_val - 5e2
+            # assert new_weight >= 0, f"new_weight={new_weight} is negative for slack_val={slack_val}"
+            # assert new_weight >= weight_val, f"new_weight={new_weight} is less than original weight_val={weight_val}"
+
+            # df_row = df_row.with_columns(pl.lit(max(weight_val, slack_val - 3e3)).alias("AW (lbs)"))
+            df_row = df_row.with_columns(pl.lit(new_weight).alias("AW (lbs)"))
             # append the new row to the local augmented dataframe
-            aug_ship_dist = aug_ship_dist.vstack(new_row)
+            aug_ship_dist = aug_ship_dist.vstack(df_row)
 
             # append the new tensor row to the local augmented tensor
             aug_obs_ship_tens = torch.cat([aug_obs_ship_tens, tens_row.unsqueeze(0)], dim=0)
@@ -178,7 +209,7 @@ class SyntheticDataGenerator:
         """Load the T100 data, clean it, and compute the feature tensor."""
         df = self.proc.filter_data()
         df = df.filter(pl.col("SLACK").is_not_null()).filter(~pl.col("SLACK").is_nan())
-
+        
         # Persist the per‑flight scalar columns – they are needed during synthesis.
         # self.u_max_all = df["PAYLOAD_PER_FLIGHT"].to_numpy().astype(np.float32)
         # self.u_cargo_all = df["FREIGHT_PER_FLIGHT"].to_numpy().astype(np.float32)
@@ -620,14 +651,24 @@ if __name__ == "__main__":
     # sanity: eps medians should span a meaningful fraction of z_T100's scale,
     # not be uniformly tiny or uniformly huge relative to it
 
-    num_rounds = 1
+    run_id = f"run_{datetime.datetime.now(tz=datetime.UTC).strftime('%Y%m%d_%H%M%S')}_{os.environ.get('SLURM_JOB_ID', 'local')}"  # noqa: DTZ005
+    base_run_dir = pathlib.Path("run_outputs") / run_id
+    base_run_dir.mkdir(parents=True, exist_ok=True)
+
+    diagnostics_path = base_run_dir / "diagnostics.json"
+    all_diagnostics = {}
+
+    num_rounds = 3
     posteriors = []
     proposal = prior  # Use the prior as the initial proposal distribution
 
-    for _ in range(num_rounds):
+    prev_train_len = 0
+    prev_val_len = 0
+
+    for rd_idx in range(num_rounds):
         theta, x = simulate_for_sbi(
             simulator,
-            prior,
+            proposal,
             num_simulations=100_000,
             simulation_batch_size=1,
             seed=generator.config.seed,
@@ -644,18 +685,31 @@ if __name__ == "__main__":
 
         proposal = posterior.set_default_x(x_o)
 
-        print("Fraction S=1 in synthetic training x:", x[:, :, -1].mean().item())
+        print(f"[round {rd_idx}] Fraction S=1 in synthetic training x:", x[:, :, -1].mean().item())
+
+        all_train = inference.summary["training_loss"]
+        all_val = inference.summary["validation_loss"]
+        round_train = all_train[prev_train_len:]
+        round_val = all_val[prev_val_len:]
+        prev_train_len = len(all_train)
+        prev_val_len = len(all_val)
+
+        fig, ax = plt.subplots()
+        ax.plot(round_train, label="train")
+        ax.plot(round_val, label="val")
+        ax.set_xlabel("epoch"); ax.set_ylabel("loss")
+        ax.set_title(f"Round {rd_idx} loss curve")
+        ax.legend()
+        fig.savefig(base_run_dir / f"loss_curve_round_{rd_idx}.png", dpi=150)
+        plt.close(fig)
 
         # ============================================================
         # DIAGNOSTICS BLOCK
         # ============================================================
-        run_dir = pathlib.Path("run_outputs") / f"run_{generator.config.seed}"
-        run_dir.mkdir(parents=True, exist_ok=True)
-
         # persist artifacts
-        torch.save(density_estimator.state_dict(), run_dir / "density_estimator.pt")
-        torch.save({"theta": theta.cpu(), "x": x.cpu()}, run_dir / "training_data.pt")
-        with open(run_dir / "training_summary.json", "w") as f:
+        torch.save(density_estimator.state_dict(), base_run_dir / f"density_estimator_{rd_idx}.pt")
+        torch.save({"theta": theta.cpu(), "x": x.cpu()}, base_run_dir / f"training_data_{rd_idx}.pt")
+        with open(base_run_dir / f"training_summary_{rd_idx}.json", "w") as f:
             json.dump({k: v for k, v in inference.summary.items()}, f, default=str)
 
         diagnostics = {}
@@ -665,25 +719,27 @@ if __name__ == "__main__":
         x_test = simulator(theta_test[0]).to(device)
         post_test = posterior.sample((2000,), x=x_test).detach().cpu()
         prior_samp = prior.sample((2000,)).cpu()
-        diagnostics["contraction_ratio"] = (post_test.std(dim=0) / prior_samp.std(dim=0))[:10].tolist()
+        diagnostics["contraction_ratio"] = (post_test.std(dim=0) / prior_samp.std(dim=0)).tolist()
 
         samples_xo = posterior.sample((2000,), x=x_o).detach().cpu()
-        diagnostics["posterior_std_xo"] = samples_xo.std(dim=0)[:10].tolist()
-        diagnostics["posterior_mean_xo"] = samples_xo.mean(dim=0)[:10].tolist()
+        diagnostics["posterior_std_xo"] = samples_xo.std(dim=0).tolist()
+        diagnostics["posterior_mean_xo"] = samples_xo.mean(dim=0).tolist()
 
         diagnostics["z_gen_stats"] = {
             "median": float(np.median(generator.z_gen_sel)),
             "frac_zero": float((generator.z_gen_sel == 0).mean()),
         }
 
-        with open(run_dir / "diagnostics.json", "w") as f:
-            json.dump(diagnostics, f, indent=2)
+        all_diagnostics[f"round_{rd_idx}"] = diagnostics
+
+        with open(diagnostics_path, "w") as f:
+            json.dump(all_diagnostics, f, indent=2)
 
         theta_sbc, x_sbc = simulate_for_sbi(simulator, prior, num_simulations=300,
                                               simulation_batch_size=1, seed=123)
         ranks, _ = run_sbc(theta_sbc, x_sbc.to(device), posterior, num_posterior_samples=1000)
         fig, ax = sbc_rank_plot(ranks, num_posterior_samples=1000, num_bins=20)
-        fig.savefig(run_dir / "sbc_rank_plot.png", dpi=150)
+        fig.savefig(base_run_dir / f"sbc_rank_plot_{rd_idx}.png", dpi=150)
         plt.close(fig)
 
     print("Posterior ready for conditioning on x_o with shape:", tuple(x_o.shape))
@@ -695,17 +751,17 @@ if __name__ == "__main__":
     ax.plot(inference.summary["training_loss"], label="train")
     ax.plot(inference.summary["validation_loss"], label="val")
     ax.set_xlabel("epoch"); ax.set_ylabel("loss"); ax.legend()
-    fig.savefig("loss_curve.png", dpi=150)
+    fig.savefig(base_run_dir / "loss_curve.png", dpi=150)
 
     print("Saved to loss_curve.png")
 
-    # posterior_samples = posterior.sample((1,), x=x_o)
 
-    samples = posterior.sample((2_000,), x=x_o).detach().cpu()
-    print("posterior std (34 overlapping rows only):", samples.std(dim=0)[:5])
-    print("posterior mean (34 overlapping rows only):", samples.mean(dim=0)[:5])
+    final_posterior = posteriors[-1]
+    samples = final_posterior.sample((2_000,), x=x_o).detach().cpu()
+    print("posterior std:", samples.std(dim=0)[:10])
+    print("posterior mean:", samples.mean(dim=0)[:10])
 
-    subset = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    subset = list(range(7))
     n_bound = 4 * std
 
     fig, axes = pairplot(
@@ -715,7 +771,7 @@ if __name__ == "__main__":
         figsize=(6, 6),
     )
 
-    fig.savefig("pairplot.png", dpi=150)
+    fig.savefig(base_run_dir / "pairplot.png", dpi=150)
     print("Saved to pairplot.png")
 
     theta_test = prior.sample((1,))
@@ -723,3 +779,36 @@ if __name__ == "__main__":
     post_test = posterior.sample((2_000,), x=x_test.to(device)).detach().cpu()
     print("posterior std (in-dist x):", post_test.std(dim=0)[:5])
     print("prior std:", prior.sample((2_000,)).std(dim=0)[:5])
+
+    # ============================================================
+    # FINAL psi_bar — computed once, after all rounds, from the final posterior
+    # ============================================================
+    n_psi_draws = 1_000
+    batch_size = 50
+
+    psi_sum = np.zeros(2 * generator.n_design, dtype=np.float64)
+    psi_sq_sum = np.zeros(2 * generator.n_design, dtype=np.float64)
+    n_done = 0
+
+    while n_done < n_psi_draws:
+        n = min(batch_size, n_psi_draws - n_done)
+        draws = final_posterior.sample((n,), x=x_o).cpu().numpy().astype(np.float64)
+        psi_sum += draws.sum(axis=0)
+        psi_sq_sum += (draws ** 2).sum(axis=0)
+        n_done += n
+
+    psi_bar = psi_sum / n_done
+    psi_std = np.sqrt(np.maximum(psi_sq_sum / n_done - psi_bar ** 2, 0.0))
+    psi_mc_se = psi_std / np.sqrt(n_done)
+
+    np.savez(
+        base_run_dir / "psi_bar.npz",
+        psi_bar=psi_bar,
+        psi_std=psi_std,
+        psi_mc_se=psi_mc_se,
+        n_design=generator.n_design,
+        n_draws=n_done,
+        final_round=num_rounds - 1,
+    )
+    print(f"Saved E[psi] from final round ({num_rounds - 1}) over {n_done} draws.")
+    print(f"Max MC SE across coords: {psi_mc_se.max():.4g}")
