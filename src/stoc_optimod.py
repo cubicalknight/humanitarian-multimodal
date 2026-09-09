@@ -15,59 +15,126 @@ Where ξ = {A, B} represents random carrier acceptance and aircraft compatibilit
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Sequence
+import math
+import random
+import signal
+from collections.abc import Sequence
+from dataclasses import dataclass, field
+from math import cos, radians, sin
+from pathlib import Path
 
+import cartopy.crs as ccrs
+import cartopy.feature as cfeature
 import gurobipy as gp
+import matplotlib.pyplot as plt
 from gurobipy import GRB
-
+from matplotlib.lines import Line2D
+from tqdm import tqdm
 
 # ============================================================================
 # Data Structures
 # ============================================================================
+# Global flag to handle interruption
+# interrupted = False
+# def signal_handler(sig, frame):
+#     global interrupted
+
+#     interrupted = True
+#     print("\nInterrupt received! Stopping optimization...")
+# # Register the signal handler for KeyboardInterrupt (Ctrl+C)
+# signal.signal(signal.SIGINT, signal_handler)
+
+# times = []
+# gaps = []
+# def my_callback(model, where):
+#     global interrupted
+
+#     if where == GRB.Callback.MIP:
+#         time = model.cbGet(GRB.Callback.RUNTIME)
+#         # time = model.cbGet(GRB.Callback.MIP_NODCNT)
+#         gap = abs(model.cbGet(GRB.Callback.MIP_OBJBST) - model.cbGet(GRB.Callback.MIP_OBJBND))/abs(model.cbGet(GRB.Callback.MIP_OBJBST)) * 100
+
+#         if gap != float('inf'):
+#             print(f"Time: {time:.2f} seconds, Gap: {gap:.2f}%")
+#             times.append(time)
+#             gaps.append(gap)
+
+#     if where == GRB.Callback.MIPNODE and interrupted:
+#         model.terminate()  # Stop optimization safely
 
 
-@dataclass(frozen=True)
-class FlightOption:
-    """Represents a single flight option (route + airline)."""
+@dataclass(frozen=True, slots=True)
+class Node:
+    """Represents a node in the network (airport or non-airport)."""
+    node_id: str
+    latitude: float
+    longitude: float
+    connection_type: str | None = None  # e.g., "airport", "gnd", etc.
+
+@dataclass(frozen=True, slots=True)
+class LegOption:
+    """Represents a single leg option (route + mode)."""
     route_id: str
-    airline_id: str
-    origin: str
-    destination: str
+    # airline_id: str
+    origin: Node
+    destination: Node
     distance_miles: float
-    cost_flight: float  # c_flight: upfront flight cost
+    mode: str
 
+    mu_slack: float | None = None
+    sigma_slack: float | None = None
+    u_vec: tuple[float, ...] | None = field(init=False, default=None)
 
-@dataclass(frozen=True)
+    def __post_init__(self) -> None:
+        if self.mode == "air":
+            object.__setattr__(self, "u_vec", self._to_unit_cartesian())
+
+    def _to_unit_cartesian(self) -> tuple[float, ...]:
+        origin_lat = radians(self.origin.latitude)
+        origin_lon = radians(self.origin.longitude)
+        destination_lat = radians(self.destination.latitude)
+        destination_lon = radians(self.destination.longitude)
+
+        return (
+            cos(origin_lon) * cos(origin_lat),
+            sin(origin_lon) * cos(origin_lat),
+            sin(origin_lat),
+            cos(destination_lon) * cos(destination_lat),
+            sin(destination_lon) * cos(destination_lat),
+            sin(destination_lat),
+            self.distance_miles / 20_000,
+        )
+
+# TODO change origin dest to Node objects
+@dataclass(frozen=True, slots=True)
 class Shipment:
     """Represents a single shipment to be assigned."""
     shipment_id: str
-    weight_kg: float
-    origin: str | None = None
-    destination: str | None = None
+    weight: float
+    origin: Node
+    destination: Node
     pallets: float = 0.0
     equivalent_cost: float = 0.0
     commodity: str | None = None
 
 
-@dataclass(frozen=True)
+@dataclass(slots=True)
 class UncertaintyRealization:
     """
-    Represents a realization of uncertainty ξ = {A, B}.
-    
-    A_{s,(i,j),a}: binary indicator of carrier acceptance
-    B_{s,(i,j),a}: binary indicator of aircraft compatibility (given acceptance)
+    Represents a realization of uncertainty ξ = {U}.
     """
-    shipment_id: str
-    flight_id: str
-    acceptance: bool
-    compatibility: bool
+    leg: LegOption
+    num_scenarions: int
+    scenario_realize: list[float]
 
 
-@dataclass
+@dataclass(slots=True)
 class StochasticOptimizationParameters:
     """Parameters for the two-stage stochastic program."""
     
+    cost_flight: float
+    cost_ground: float
+
     # Cost parameters
     cost_penalty_rejection: float  # c_pt: penalty for carrier rejection
     cost_penalty_incompatibility: float  # Penalty for aircraft incompatibility
@@ -88,7 +155,7 @@ class StochasticOptimizationParameters:
         return original_cost * 0.5  # Default: 50% markup on reassignment
 
 
-@dataclass
+@dataclass(slots=True)
 class FirstStageSolution:
     """Solution from the first stage optimization."""
     assignments: dict[tuple[str, str], float]  # (shipment_id, flight_id) -> probability
@@ -96,7 +163,7 @@ class FirstStageSolution:
     status: str
     
 
-@dataclass
+@dataclass(slots=True)
 class SecondStageSolution:
     """Solution from the second stage optimization."""
     keep_assignments: dict[tuple[str, str], float]  # (shipment_id, flight_id) -> keep indicator
@@ -105,7 +172,7 @@ class SecondStageSolution:
     status: str
 
 
-@dataclass
+@dataclass(slots=True)
 class TwoStageSolution:
     """Complete solution from both stages."""
     first_stage: FirstStageSolution
