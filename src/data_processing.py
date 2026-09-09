@@ -294,10 +294,10 @@ class DataProcessing:
         return df_final
 
 
-    def _encode_features(self, df: pl.DataFrame,
+    def _encode_features(self, df_raw: pl.DataFrame,
                          is_training: bool = True) -> pl.DataFrame:
         target_col = self.features.target_column
-        df = self._canonicalize_route_columns(df)
+        df = self._canonicalize_route_columns(df_raw)
         
         # 1. Encode Target (if it exists in this dataset)
         # NOTE no longer necessary to encode target as it is not used in the current training pipeline 
@@ -349,6 +349,22 @@ class DataProcessing:
                 df = df.with_columns(
                     pl.Series(col, [cat_map.get(val, 0) for val in df[col]], dtype=pl.Int32)
                 )
+
+                # print the number of zero assignments for this column to check if there are many unknowns
+                num_unknowns = (df[col] == 0).sum()
+                if num_unknowns > 0:
+                    breakpoint()
+                    warnings.warn(
+                        f"Column '{col}' has {num_unknowns} entries mapped to 0 (unknown). "
+                        "This may indicate missing or unseen categories."
+                    )
+                # print exactly which values were mapped to 0 for this column
+                unknown_values = [val for val in df[col].unique().to_list() if val not in cat_map.values()]
+                if unknown_values:
+                    warnings.warn(
+                        f"Column '{col}' has the following values mapped to 0 (unknown): {unknown_values}. "
+                        "This may indicate missing or unseen categories."
+                    )
 
             # Otherwise, treat as numerical
             else:
@@ -511,23 +527,25 @@ class T100DataProcessing(DataProcessing):
     def _truncated_slack_samples(self, mu: np.ndarray, sigma: np.ndarray, n_draws: int = 1) -> np.ndarray:
         """Generates samples from a truncated normal distribution bounded at 0."""
         out = np.zeros((mu.size, n_draws))
-        positive_sigma = sigma > 0
+        positive_sigma = np.array(sigma > 0)
 
         # Standardized truncation bounds (a = lower bound, b = upper bound)
         a = (0 - mu[positive_sigma]) / sigma[positive_sigma]
         b = np.full_like(a, np.inf)
 
-        out[positive_sigma] = truncnorm.rvs(
-            a[:, None],
-            b[:, None],
-            loc=mu[positive_sigma][:, None],
-            scale=sigma[positive_sigma][:, None],
-            size=(positive_sigma.sum(), n_draws),
-            random_state=self.rng,
-        )
+        if True in positive_sigma:
+            out[positive_sigma] = truncnorm.rvs(
+                a[:, None],
+                b[:, None],
+                loc=mu[positive_sigma][:, None],
+                scale=sigma[positive_sigma][:, None],
+                size=(positive_sigma.sum(), n_draws),
+                random_state=self.rng,
+            )
 
         # Deterministic rows (where sigma is 0, e.g., cargo-only flights)
-        out[~positive_sigma] = np.maximum(mu[~positive_sigma], 0.0)[:, None]
+        if False in positive_sigma:
+            out[~positive_sigma] = np.maximum(mu[~positive_sigma], 0.0)[:, None]
         return out
 
     def filter_data(self, df: pl.DataFrame = None) -> pl.DataFrame:
@@ -580,7 +598,7 @@ class T100DataProcessing(DataProcessing):
         self.sigma_z = np.sqrt(np.maximum(u_pax, 0.0)) * self.sigma_pax
 
         # Generate truncated slack samples
-        slack_samples = self._truncated_slack_samples(self.mu_z, self.sigma_z, n_draws=100)
+        slack_samples = self._truncated_slack_samples(self.mu_z, self.sigma_z, n_draws=1000)
         expected_slack = np.mean(slack_samples, axis=1)
 
         df_final = df_per_flt.with_columns([
@@ -644,6 +662,11 @@ if __name__ == "__main__":
 
     # Get the actual DataFrame of overlapping pairs
     overlap_df = dp.get_od_overlap(df_shipping, df_t100)
+
+    dp.align_from(t100_processor)  # Align the shipping processor with the T100 processor
+    observed_ship_tensor, observed_weight_tensor = dp.to_tensor(
+                overlap_df, is_training=False, simple=True, just_num=True, normalize_and_convert=True
+            )
 
     # Print the pairs
     print("Overlapping Origin-Destination pairs:")
