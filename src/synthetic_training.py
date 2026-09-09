@@ -537,6 +537,82 @@ import optuna
 def objective(trial: optuna.Trial):
     pass
 
+def theta_sensitivity_check(generator, n_theta=30, n_gamma_draws=50):
+    """Compare between-theta variance to within-theta (draw) variance
+    for alpha, beta, and epsilon, holding the flight set fixed."""
+    generator._sample_flights(n_samples=100)   # freeze flights for this diagnostic only
+    design_matr = generator.design_sell
+
+    alpha_means, beta_means, eps_means = [], [], []
+    alpha_within, beta_within, eps_within = [], [], []
+
+    for _ in range(n_theta):
+        theta_i = generator._sample_theta().numpy()
+        generator._set_hyperprior_from_theta(theta_i)
+
+        a, b = generator._alpha_beta(design_matr)          # shape (n_flights,)
+        eps_draws = np.stack([
+            generator.rng.gamma(a, b) * 1e4 for _ in range(n_gamma_draws)
+        ])  # shape (n_gamma_draws, n_flights)
+
+        alpha_means.append(a.mean())
+        beta_means.append(b.mean())
+        eps_means.append(eps_draws.mean())
+
+        alpha_within.append(0.0)         # alpha/beta are deterministic given theta
+        beta_within.append(0.0)
+        eps_within.append(eps_draws.std())  # only epsilon has draw-level noise
+
+    alpha_means, beta_means, eps_means = map(np.array, (alpha_means, beta_means, eps_means))
+    eps_within = np.array(eps_within)
+
+    between_var_eps = eps_means.var()
+    within_var_eps = (eps_within ** 2).mean()
+
+    print(f"alpha across theta:  mean={alpha_means.mean():.4g}, std={alpha_means.std():.4g}")
+    print(f"beta across theta:   mean={beta_means.mean():.4g}, std={beta_means.std():.4g}")
+    print(f"epsilon across theta: mean={eps_means.mean():.4g}, between-theta std={eps_means.std():.4g}")
+    print(f"epsilon within-theta (draw noise) std: {eps_within.mean():.4g}")
+    print(f"Variance ratio (between / (between+within)): "
+          f"{between_var_eps / (between_var_eps + within_var_eps):.4f}")
+
+    return alpha_means, beta_means, eps_means, eps_within
+
+def theta_sensitivity_check_aggregate(generator, n_theta=30, n_flights=40, n_gamma_draws=50):
+    """Same idea, but aggregated over n_flights per theta — matches what
+    PermutationInvariantEmbedding actually pools over in simulator()."""
+    eps_agg_means = []   # one aggregate (mean over flights) per theta
+    eps_agg_within = []  # spread of that aggregate across repeated draws, same theta
+
+    for _ in range(n_theta):
+        generator._sample_flights(n_samples=n_flights)
+        design_matr = generator.design_sell
+
+        theta_i = generator._sample_theta().numpy()
+        generator._set_hyperprior_from_theta(theta_i)
+        a, b = generator._alpha_beta(design_matr)
+
+        # repeat the full n_flights draw n_gamma_draws times, take the mean each time
+        agg_draws = np.array([
+            (generator.rng.gamma(a, b) * 1e4).mean()
+            for _ in range(n_gamma_draws)
+        ])
+
+        eps_agg_means.append(agg_draws.mean())
+        eps_agg_within.append(agg_draws.std())
+
+    eps_agg_means = np.array(eps_agg_means)
+    eps_agg_within = np.array(eps_agg_within)
+
+    between_var = eps_agg_means.var()
+    within_var = (eps_agg_within ** 2).mean()
+
+    print(f"aggregate epsilon across theta: mean={eps_agg_means.mean():.4g}, "
+          f"between-theta std={eps_agg_means.std():.4g}")
+    print(f"aggregate epsilon within-theta std: {eps_agg_within.mean():.4g}")
+    print(f"Variance ratio (aggregate): {between_var / (between_var + within_var):.4f}")
+
+    return eps_agg_means, eps_agg_within
 
 if __name__ == "__main__":
     # _demo()
@@ -599,8 +675,8 @@ if __name__ == "__main__":
     # )
 
     single_trial_embedding = FCEmbedding(
-        generator.n_design + 2,# 668,
-        generator.n_design * 2,
+        input_dim=generator.n_design + 2,# 668,
+        num_hiddens=generator.n_design * 2,
     )
 
     embedding_net = PermutationInvariantEmbedding(
@@ -633,6 +709,8 @@ if __name__ == "__main__":
     print("S=1 fraction (probe):", x_probe[:, :, -1].mean().item())
     print("theta probe std:", theta_probe.std(dim=0)[:5])
 
+    breakpoint()  # sanity check: inspect x_o, theta_probe, x_probe
+
     # generator._sample_flights(n_samples=40)  # match your actual n_flights per sim
     # mu_z = (generator.u_max_sel - generator.u_cargo_sel - generator.u_mail_sel
     #         - generator.u_pax_sel * generator.proc.mu_pax)
@@ -658,12 +736,50 @@ if __name__ == "__main__":
     diagnostics_path = base_run_dir / "diagnostics.json"
     all_diagnostics = {}
 
-    num_rounds = 3
+    num_rounds = 1
     posteriors = []
     proposal = prior  # Use the prior as the initial proposal distribution
 
     prev_train_len = 0
     prev_val_len = 0
+
+    '''
+    # ============================================================
+    # MEMORY ESTIMATION DEBUG BLOCK
+    # ============================================================
+    print("\n--- MEMORY DEBUGGING ESTIMATION ---")
+    
+    # 1. Run a single simulation to get exact shapes and types
+    dummy_theta = prior.sample((1,))[0]
+    dummy_x = simulator(dummy_theta)
+    
+    # 2. Calculate bytes per item (number of elements * bytes per element)
+    bytes_per_theta = dummy_theta.nelement() * dummy_theta.element_size()
+    bytes_per_x = dummy_x.nelement() * dummy_x.element_size()
+    
+    target_sims = 1_000_000  # Change this to whatever you plan to run
+    
+    # 3. Project to Gigabytes
+    total_theta_gb = (bytes_per_theta * target_sims) / (1024**3)
+    total_x_gb = (bytes_per_x * target_sims) / (1024**3)
+    base_memory_gb = total_theta_gb + total_x_gb
+    
+    print(f"Shape of single x output: {tuple(dummy_x.shape)}")
+    print(f"Memory for 1 simulation (x): {bytes_per_x} bytes")
+    print(f"Expected base memory for {target_sims} thetas: {total_theta_gb:.2f} GB")
+    print(f"Expected base memory for {target_sims} xs: {total_x_gb:.2f} GB")
+    
+    # 4. Account for SBI / PyTorch overhead
+    # sbi and PyTorch will duplicate this data in memory when stacking lists into 
+    # tensors, converting to datasets, and creating data loaders. A safe multiplier is ~2.5x.
+    overhead_factor = 2.5
+    recommended_mem = (base_memory_gb * overhead_factor) + 10 # +10GB for OS/Python overhead
+    
+    print(f"-> RECOMMENDED SLURM --mem ALLOCATION: ~{int(recommended_mem)}G")
+    print("-----------------------------------\n")
+    
+    # Optional: Automatically exit here if you just want to check memory
+    sys.exit(0)'''
 
     for rd_idx in range(num_rounds):
         theta, x = simulate_for_sbi(
@@ -725,6 +841,7 @@ if __name__ == "__main__":
         diagnostics["posterior_std_xo"] = samples_xo.std(dim=0).tolist()
         diagnostics["posterior_mean_xo"] = samples_xo.mean(dim=0).tolist()
 
+        breakpoint()
         diagnostics["z_gen_stats"] = {
             "median": float(np.median(generator.z_gen_sel)),
             "frac_zero": float((generator.z_gen_sel == 0).mean()),
