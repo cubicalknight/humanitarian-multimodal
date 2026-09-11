@@ -37,13 +37,13 @@ class SyntheticGeneratorConfig:
     Attributes
     ----------
     seed : int
-        Seed for pseudo‑random generators.
+        Seed for pseudo-random generators.
     n_flights : int
         Number of flights to sample from T100.
     k_swaps : int
         Number of weight sweeps per flight.
     loguniform_low : float
-        Lower bound for the log‑uniform weight sweep.
+        Lower bound for the log-uniform weight sweep.
     """
     seed: int = 42
     n_flights: int = 1
