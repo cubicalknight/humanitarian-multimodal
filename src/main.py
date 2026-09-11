@@ -1,654 +1,688 @@
-# %%
+"""Run a Slurm-array cost sensitivity analysis for ``stoc_optimod``.
+
+Workflow:
+1. Run ``--prepare`` once to build the network and a shared scenario sample.
+2. Submit one Slurm array task per cost-parameter combination.
+3. Run ``--merge`` after the array is complete to create one summary JSON file.
+
+Each array task reads the prepared problem and writes only its own result file.
+This avoids repeated data preparation and any concurrent writes to shared results.
+"""
+
 from __future__ import annotations
 
 import argparse
+import hashlib
+import itertools
+import json
+import os
+import pickle
 import sys
-# import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import gurobipy as gp
 import numpy as np
 import polars as pl
-import torch
-import pickle as pkl
+from sklearn.neighbors import BallTree
 
-from data_processing import DataProcessing
-from nce_model import NoiseGeneration, TrainNCE
-from reproduce_with_stochastic_airlift import configure_determinism, train_torch_mnlr
-from stochastic_airlift import MultinomialLogitAircraftModel
+from data_processing import DataProcessing, T100DataProcessing
 from stoc_optimod import (
-    FlightOption,
+    LegOption,
+    Node,
     Shipment,
     StochasticOptimizationParameters,
     TwoStageSolver,
     UncertaintyRealization,
 )
-from unified_data_loader import build_shared_split
 
+COST_FIELDS = (
+    "cost_flight",
+    "cost_ground",
+    "cost_penalty_incompatibility",
+    "cost_reassignment",
+)
 
-CONFIG_INDEX = {
-    "Narrowbody": 0,
-    "Widebody": 1,
-    "Freighter": 2,
+DEFAULT_CONFIG: dict[str, Any] = {
+    "seed": 42,
+    "num_scenarios": 100,
+    "shipment_limit": None,
+    "base_parameters": {
+        "cost_flight": 4.0,
+        "cost_ground": 2.0,
+        "cost_penalty_incompatibility": 5.0,
+        "cost_reassignment": None,
+    },
+    "parameter_values": {
+        "cost_flight": [4.0],
+        "cost_ground": [2.0],
+        "cost_penalty_incompatibility": [5.0],
+        "cost_reassignment": [None],
+    },
+    "solver": {
+        "threads": None,
+        "time_limit_seconds": None,
+        "mip_gap": None,
+        "quiet": False,
+    },
+    "network": {
+        "nearby_city_radius_miles": 100.0,
+        "max_city_attempts": 10,
+        "max_ground_distance_miles": 500.0,
+    },
 }
 
+SCRIPT_DIR = Path(__file__).resolve().parent
 
-def _config_index(config_name: str) -> int:
-    if config_name not in CONFIG_INDEX:
-        raise ValueError(
-            f"Unexpected aircraft configuration '{config_name}'. "
-            "Expected one of ['Narrowbody', 'Widebody', 'Freighter']."
+
+def _relative_to_script(path: Path) -> Path:
+    """Resolve relative CLI paths from this script's directory."""
+    return path if path.is_absolute() else SCRIPT_DIR / path
+
+
+@dataclass(slots=True)
+class PreparedProblem:
+    """The immutable input shared by all sensitivity-array tasks."""
+
+    shipments: dict[str, Shipment]
+    legs: dict[tuple[str, str, str], LegOption]
+    scenarios: dict[tuple[str, str, str], UncertaintyRealization]
+    seed: int
+    num_scenarios: int
+
+
+def _merge_defaults(given: dict[str, Any], defaults: dict[str, Any]) -> dict[str, Any]:
+    """Recursively merge a user config with the supported defaults."""
+    merged = dict(defaults)
+    for key, value in given.items():
+        if isinstance(value, dict) and isinstance(defaults.get(key), dict):
+            merged[key] = _merge_defaults(value, defaults[key])
+        else:
+            merged[key] = value
+    return merged
+
+
+class SensitivityConfig:
+    """Loads, validates, and expands the JSON sensitivity configuration."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.data = _merge_defaults(json.loads(path.read_text()), DEFAULT_CONFIG)
+        self._validate()
+
+    def _validate(self) -> None:
+        unknown_fields = set(self.data["parameter_values"]) - set(COST_FIELDS)
+        if unknown_fields:
+            raise ValueError(f"Unknown cost fields: {sorted(unknown_fields)}")
+
+        for field in COST_FIELDS:
+            values = self.data["parameter_values"].get(
+                field,
+                [self.data["base_parameters"][field]],
+            )
+            if not isinstance(values, list) or not values:
+                raise ValueError(f"parameter_values.{field} must be a non-empty list.")
+            if field != "cost_reassignment" and any(
+                value is None or float(value) < 0 for value in values
+            ):
+                raise ValueError(f"parameter_values.{field} must contain non-negative values.")
+
+    def combinations(self) -> list[dict[str, float | None]]:
+        """Return the Cartesian product of configured parameter values."""
+        value_lists = [
+            self.data["parameter_values"].get(
+                field,
+                [self.data["base_parameters"][field]],
+            )
+            for field in COST_FIELDS
+        ]
+        return [
+            dict(zip(COST_FIELDS, combination, strict=True))
+            for combination in itertools.product(*value_lists)
+        ]
+
+
+class ProblemPreparer:
+    """Build the original ``stoc_optimod.__main__`` input once."""
+
+    MILES_PER_METER = 0.000621371
+    EARTH_RADIUS_MILES = 3958.8
+
+    def __init__(self, config: SensitivityConfig) -> None:
+        self.config = config.data
+        self.rng = np.random.default_rng(self.config["seed"])
+
+    def prepare(self) -> PreparedProblem:
+        """Prepare shipments, network legs, and common random-number scenarios."""
+        t100_processor = T100DataProcessing()
+        t100_processor.rng = np.random.default_rng(self.config["seed"])
+
+        t100_data = t100_processor.filter_data()
+        t100_data = t100_processor._geolocate_nodes(t100_data)
+        t100_data = t100_processor._calculate_distance(t100_data)
+
+        shipping_processor = DataProcessing()
+        shipping_processor.align_from(t100_processor)
+        shipping_data = shipping_processor.load_shipping_data()
+        shipping_data = shipping_processor._geolocate_nodes(shipping_data)
+        shipping_data = shipping_processor._calculate_distance(shipping_data)
+
+        overlap = shipping_processor.get_od_overlap(shipping_data, t100_data)
+        overlap = overlap.with_columns(
+            pl.col("AW (lbs)").cast(pl.Float64, strict=False),
+            pl.col("Commercial Cost for First Mile").cast(pl.Float64, strict=False),
+            pl.col("Commercial Cost for Last Mile").cast(pl.Float64, strict=False),
         )
-    return CONFIG_INDEX[config_name]
+
+        legs, nodes = self._build_air_network(t100_data)
+        shipments = self._build_shipments_and_ground_links(overlap, nodes, legs)
+
+        if self.config["shipment_limit"] is not None:
+            shipments = dict(
+                itertools.islice(shipments.items(), int(self.config["shipment_limit"]))
+            )
+        if not shipments:
+            raise ValueError("No valid overlapping shipments were found.")
+
+        scenarios = self._build_scenarios(legs, t100_processor)
+        return PreparedProblem(
+            shipments=shipments,
+            legs=legs,
+            scenarios=scenarios,
+            seed=int(self.config["seed"]),
+            num_scenarios=int(self.config["num_scenarios"]),
+        )
+
+    @staticmethod
+    def _build_air_network(
+        t100_data: pl.DataFrame,
+    ) -> tuple[dict[tuple[str, str, str], LegOption], dict[str, Node]]:
+        """Create airport nodes and one air leg for every T100 origin/destination."""
+        legs: dict[tuple[str, str, str], LegOption] = {}
+        nodes: dict[str, Node] = {}
+
+        for row in t100_data.iter_rows(named=True):
+            origin = str(row["ORIGIN"])
+            destination = str(row["DEST"])
+
+            nodes.setdefault(
+                origin,
+                Node(origin, float(row["Origin_Lat"]), float(row["Origin_Lon"]), "air"),
+            )
+            nodes.setdefault(
+                destination,
+                Node(
+                    destination,
+                    float(row["Destination_Lat"]),
+                    float(row["Destination_Lon"]),
+                    "air",
+                ),
+            )
+
+            route = (origin, destination, "air")
+            legs[route] = LegOption(
+                route_id=f"{origin}_{destination}",
+                origin=nodes[origin],
+                destination=nodes[destination],
+                distance_miles=float(row["DISTANCE"]),
+                mode="air",
+                mu_slack=float(row["MU_SLACK"]),
+                sigma_slack=float(row["SIGMA_SLACK"]),
+            )
+
+        return legs, nodes
+
+    def _build_shipments_and_ground_links(
+        self,
+        overlap: pl.DataFrame,
+        nodes: dict[str, Node],
+        legs: dict[tuple[str, str, str], LegOption],
+    ) -> dict[str, Shipment]:
+        """Build shipment endpoint nodes and cached OSRM ground connections."""
+        import geonamescache
+        import requests
+
+        network_config = self.config["network"]
+        airport_ids = sorted(nodes)
+        airport_tree = BallTree(
+            np.radians([(nodes[airport].latitude, nodes[airport].longitude) for airport in airport_ids]),
+            metric="haversine",
+        )
+        cities = [
+            {
+                "lat": city["latitude"],
+                "lon": city["longitude"],
+                "country": city["countrycode"],
+            }
+            for city in geonamescache.GeonamesCache().get_cities().values()
+        ]
+        city_tree = BallTree(
+            np.radians([(city["lat"], city["lon"]) for city in cities]),
+            metric="haversine",
+        )
+
+        cache_path = Path(__file__).parent / "cache" / "routing_cache.json"
+        routing_cache = json.loads(cache_path.read_text()) if cache_path.exists() else {}
+        cache_is_dirty = False
+        airport_countries: dict[str, str] = {}
+
+        def airport_country(airport_id: str) -> str:
+            if airport_id not in airport_countries:
+                airport = nodes[airport_id]
+                nearest_city = city_tree.query(
+                    np.radians([(airport.latitude, airport.longitude)]),
+                    k=1,
+                )[1][0][0]
+                airport_countries[airport_id] = cities[nearest_city]["country"]
+            return airport_countries[airport_id]
+
+        def drivable_route(
+            origin_lat: float,
+            origin_lon: float,
+            destination_lat: float,
+            destination_lon: float,
+        ) -> dict[str, Any]:
+            """Use a local cache around one OSRM driving-route request."""
+            nonlocal cache_is_dirty
+            raw_key = (
+                f"{origin_lat:.5f},{origin_lon:.5f},"
+                f"{destination_lat:.5f},{destination_lon:.5f}"
+            )
+            key = hashlib.sha1(raw_key.encode()).hexdigest()
+
+            if key not in routing_cache:
+                try:
+                    url = (
+                        "https://router.project-osrm.org/route/v1/driving/"
+                        f"{origin_lon},{origin_lat};{destination_lon},{destination_lat}"
+                        "?overview=false"
+                    )
+                    response = requests.get(url, timeout=10)
+                    response.raise_for_status()
+                    data = response.json()
+                    routes = data.get("routes", [])
+                    routing_cache[key] = {
+                        "feasible": data.get("code") == "Ok" and bool(routes),
+                        "distance_m": routes[0]["distance"] if routes else None,
+                    }
+                except requests.RequestException:
+                    routing_cache[key] = {"feasible": False, "distance_m": None}
+                cache_is_dirty = True
+
+            return routing_cache[key]
+
+        endpoint_nodes: dict[tuple[str, str, str], Node] = {}
+        for row in overlap.iter_rows(named=True):
+            ngo_id = str(row["NGO ID"])
+            endpoint_specs = (
+                ("O", str(row["ORIGIN"]), "Commercial Cost for First Mile"),
+                ("D", str(row["DEST"]), "Commercial Cost for Last Mile"),
+            )
+            for side, airport_id, cost_column in endpoint_specs:
+                endpoint_key = (ngo_id, airport_id, side)
+                if row[cost_column] is None or endpoint_key in endpoint_nodes:
+                    continue
+
+                airport = nodes[airport_id]
+                nearby_city_indices = city_tree.query_radius(
+                    np.radians([(airport.latitude, airport.longitude)]),
+                    r=float(network_config["nearby_city_radius_miles"])
+                    / self.EARTH_RADIUS_MILES,
+                )[0]
+                selected_city = next(
+                    (
+                        cities[index]
+                        for index in nearby_city_indices[
+                            : int(network_config["max_city_attempts"])
+                        ]
+                        if cities[index]["country"] == airport_country(airport_id)
+                        and drivable_route(
+                            cities[index]["lat"],
+                            cities[index]["lon"],
+                            airport.latitude,
+                            airport.longitude,
+                        )["feasible"]
+                    ),
+                    None,
+                )
+                if selected_city is None:
+                    raise ValueError(f"No drivable nearby city for endpoint {endpoint_key}.")
+
+                endpoint = Node(
+                    node_id=f"{ngo_id}_{airport_id}_{side}",
+                    latitude=selected_city["lat"],
+                    longitude=selected_city["lon"],
+                    connection_type="gnd",
+                )
+                endpoint_nodes[endpoint_key] = endpoint
+                nodes[endpoint.node_id] = endpoint
+
+        for endpoint in endpoint_nodes.values():
+            nearby_airports = airport_tree.query_radius(
+                np.radians([(endpoint.latitude, endpoint.longitude)]),
+                r=float(network_config["max_ground_distance_miles"])
+                / self.EARTH_RADIUS_MILES,
+            )[0]
+            for airport_index in nearby_airports:
+                airport = nodes[airport_ids[airport_index]]
+                route = drivable_route(
+                    endpoint.latitude,
+                    endpoint.longitude,
+                    airport.latitude,
+                    airport.longitude,
+                )
+                if not route["feasible"]:
+                    continue
+
+                distance_miles = float(route["distance_m"]) * self.MILES_PER_METER
+                if distance_miles > float(network_config["max_ground_distance_miles"]):
+                    continue
+
+                legs[(endpoint.node_id, airport.node_id, "ground")] = LegOption(
+                    f"{endpoint.node_id}_{airport.node_id}_ground",
+                    endpoint,
+                    airport,
+                    distance_miles,
+                    "ground",
+                )
+                legs[(airport.node_id, endpoint.node_id, "ground")] = LegOption(
+                    f"{airport.node_id}_{endpoint.node_id}_ground",
+                    airport,
+                    endpoint,
+                    distance_miles,
+                    "ground",
+                )
+
+        if cache_is_dirty:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            cache_path.write_text(json.dumps(routing_cache))
+
+        shipments: dict[str, Shipment] = {}
+        for row in overlap.iter_rows(named=True):
+            weight = row["AW (lbs)"]
+            if weight is None or float(weight) <= 0:
+                continue
+
+            ngo_id = str(row["NGO ID"])
+            origin_id = str(row["ORIGIN"])
+            destination_id = str(row["DEST"])
+            shipment_id = str(row["Shipment ID"])
+            shipments[shipment_id] = Shipment(
+                shipment_id=shipment_id,
+                weight=float(weight),
+                origin=endpoint_nodes.get((ngo_id, origin_id, "O"), nodes[origin_id]),
+                destination=endpoint_nodes.get(
+                    (ngo_id, destination_id, "D"),
+                    nodes[destination_id],
+                ),
+            )
+
+        return shipments
+
+    def _build_scenarios(
+        self,
+        legs: dict[tuple[str, str, str], LegOption],
+        t100_processor: T100DataProcessing,
+    ) -> dict[tuple[str, str, str], UncertaintyRealization]:
+        """Create one common random-number scenario set for every cost point."""
+        npz = np.load(Path(__file__).parent / "psi_bar.npz")
+        psi_bar = npz["psi_bar"]
+        n_design = int(npz["n_design"])
+        psi_alpha, psi_beta = psi_bar[:n_design], psi_bar[n_design:]
+        scenario_count = int(self.config["num_scenarios"])
+
+        scenarios: dict[tuple[str, str, str], UncertaintyRealization] = {}
+        for route, leg in legs.items():
+            if route[2] != "air":
+                continue
+
+            slack = t100_processor._truncated_slack_samples(
+                np.array([leg.mu_slack]),
+                np.array([leg.sigma_slack]),
+                scenario_count,
+            ).ravel()
+            design = np.asarray(leg.u_vec)
+            alpha = np.exp(design @ psi_alpha / np.sqrt(n_design))
+            beta = np.exp(design @ psi_beta / np.sqrt(n_design))
+            drawdown = self.rng.gamma(alpha, beta, scenario_count) * float(leg.mu_slack)
+            realizations = np.maximum(slack - drawdown, 0.0).astype(float).tolist()
+
+            scenarios[route] = UncertaintyRealization(
+                leg=leg,
+                num_scenarions=scenario_count,
+                scenario_realize=realizations,
+            )
+
+        return scenarios
+
+
+class SensitivityRunner:
+    """Solve one parameter combination and serialize its compact JSON result."""
+
+    def __init__(self, config: SensitivityConfig, prepared: PreparedProblem) -> None:
+        self.config = config
+        self.prepared = prepared
+
+    def run(self, run_index: int, output_dir: Path) -> Path:
+        combinations = self.config.combinations()
+        if not 0 <= run_index < len(combinations):
+            raise IndexError(f"run index must be in 0..{len(combinations) - 1}")
+
+        parameter_values = dict(self.config.data["base_parameters"]) | combinations[run_index]
+        solver_options = self.config.data["solver"]
+        solver = TwoStageSolver(
+            shipments=self.prepared.shipments,
+            legs=self.prepared.legs,
+            params=StochasticOptimizationParameters(**parameter_values),
+            solver_quiet=bool(solver_options["quiet"]),
+        )
+
+        model, first_stage, first_stage_cost = solver.stage_one_setup(
+            gp.Model(f"sensitivity_{run_index}")
+        )
+        model, keep, reassign, recourse_cost = solver.stage_two_setup(
+            model,
+            first_stage,
+            range(self.prepared.num_scenarios),
+            self.prepared.scenarios,
+        )
+        self._configure_gurobi(model, solver_options)
+        model.setObjective(
+            first_stage_cost + recourse_cost / self.prepared.num_scenarios,
+            gp.GRB.MINIMIZE,
+        )
+        model.optimize()
+
+        result = self._build_result(
+            run_index,
+            parameter_values,
+            model,
+            solver,
+            first_stage,
+            keep,
+            reassign,
+        )
+        output_dir.mkdir(parents=True, exist_ok=True)
+        result_path = output_dir / f"run_{run_index:06d}.json"
+        temporary_path = result_path.with_suffix(".json.tmp")
+        temporary_path.write_text(json.dumps(result, indent=2, allow_nan=False))
+        temporary_path.replace(result_path)
+        return result_path
+
+    @staticmethod
+    def _configure_gurobi(model: gp.Model, options: dict[str, Any]) -> None:
+        """Respect Slurm's CPU allocation unless a config override is supplied."""
+        allocated_threads = int(os.environ.get("SLURM_CPUS_PER_TASK", "1"))
+        model.Params.Threads = int(options["threads"] or allocated_threads)
+        if options["time_limit_seconds"] is not None:
+            model.Params.TimeLimit = float(options["time_limit_seconds"])
+        if options["mip_gap"] is not None:
+            model.Params.MIPGap = float(options["mip_gap"])
+
+    def _build_result(
+        self,
+        run_index: int,
+        parameters: dict[str, float | None],
+        model: gp.Model,
+        solver: TwoStageSolver,
+        first_stage: Any,
+        keep: Any,
+        reassign: Any,
+    ) -> dict[str, Any]:
+        """Keep only non-zero values, grouped by shipment, to control JSON size."""
+        has_solution = model.SolCount > 0
+        decisions = {
+            shipment_id: {"first_stage": [], "recourse": {}}
+            for shipment_id in solver.S
+        }
+
+        if has_solution:
+            for shipment_id in solver.S:
+                self._add_first_stage_decisions(
+                    decisions[shipment_id],
+                    shipment_id,
+                    solver,
+                    first_stage,
+                )
+                self._add_recourse_decisions(
+                    decisions[shipment_id],
+                    shipment_id,
+                    solver,
+                    keep,
+                    reassign,
+                )
+
+        return {
+            "run_index": run_index,
+            "parameters": parameters,
+            "seed": self.prepared.seed,
+            "num_scenarios": self.prepared.num_scenarios,
+            "status": int(model.Status),
+            "objective_value": float(model.ObjVal) if has_solution else None,
+            "runtime_seconds": float(model.Runtime),
+            "decision_variables_by_shipment": decisions,
+        }
+
+    @staticmethod
+    def _add_first_stage_decisions(
+        shipment_result: dict[str, Any],
+        shipment_id: str,
+        solver: TwoStageSolver,
+        first_stage: Any,
+    ) -> None:
+        for route in solver.R:
+            value = first_stage[shipment_id, *route].X
+            if value > 1e-6:
+                shipment_result["first_stage"].append(
+                    {
+                        "origin": route[0],
+                        "destination": route[1],
+                        "mode": route[2],
+                        "value": value,
+                    }
+                )
+
+    def _add_recourse_decisions(
+        self,
+        shipment_result: dict[str, Any],
+        shipment_id: str,
+        solver: TwoStageSolver,
+        keep: Any,
+        reassign: Any,
+    ) -> None:
+        for scenario_index in range(self.prepared.num_scenarios):
+            scenario_decisions = []
+            for route in solver.R:
+                keep_value = keep[shipment_id, *route, scenario_index].X
+                reassign_value = reassign[shipment_id, *route, scenario_index].X
+                if keep_value > 1e-6 or reassign_value > 1e-6:
+                    scenario_decisions.append(
+                        {
+                            "origin": route[0],
+                            "destination": route[1],
+                            "mode": route[2],
+                            "keep": keep_value,
+                            "reassign": reassign_value,
+                        }
+                    )
+            if scenario_decisions:
+                shipment_result["recourse"][str(scenario_index)] = scenario_decisions
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    # make compatible with notebook by defaulting to no arguments, but allow overrides for CLI use
-    parser = argparse.ArgumentParser(
-        description="Train NCE + aircraft models on train split and run SAA on test split."
-    )
-    parser.add_argument("--data", type=Path, default=None, help="Optional data source path.")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed.")
-    parser.add_argument("--train-ratio", type=float, default=0.7, help="Train ratio for shared split.")
-    parser.add_argument("--nce-trials", type=int, default=30, help="Optuna trials for NCE training.")
-    parser.add_argument("--n-scenarios", type=int, default=8, help="Number of SAA scenarios.")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", type=Path, required=True)
     parser.add_argument(
-        "--config-verbose",
-        action="store_true",
-        help="Print progress during config prediction model training.",
+        "--prepared-problem",
+        type=Path,
+        default=Path("output/sensitivity/prepared_problem.pkl"),
+        help=(
+            "Shared prepared input. Relative paths are resolved from this script's "
+            "directory (default: output/sensitivity/prepared_problem.pkl)."
+        ),
     )
     parser.add_argument(
-        "--config-log-every",
-        type=int,
-        default=25,
-        help="Epoch logging interval for config prediction training when --config-verbose is set.",
+        "--output-dir",
+        type=Path,
+        default=Path("output/sensitivity/results"),
     )
-    parser.add_argument(
-        "--solver-quiet",
-        action="store_true",
-        help="Disable Gurobi solver output.",
-    )
-    parser.add_argument("--retrain", action="store_true", help="Whether to retrain models instead of loading from disk.")
 
+    command = parser.add_mutually_exclusive_group(required=True)
+    command.add_argument("--prepare", action="store_true")
+    command.add_argument("--run-index", type=int)
+    command.add_argument("--print-run-count", action="store_true")
+    command.add_argument("--merge", action="store_true")
     return parser
 
 
-def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = _build_parser()
-    if argv is None:
-        if "ipykernel" in sys.modules:
-            argv = []
-        else:
-            argv = sys.argv[1:]
-    return parser.parse_args(argv)
+def main(argv: list[str] | None = None) -> None:
+    args = _build_parser().parse_args(sys.argv[1:] if argv is None else argv)
+    args.config = _relative_to_script(args.config)
+    args.prepared_problem = _relative_to_script(args.prepared_problem)
+    args.output_dir = _relative_to_script(args.output_dir)
+    config = SensitivityConfig(args.config)
 
+    if args.print_run_count:
+        print(len(config.combinations()))
+        return
 
-def _load_split_frames(
-    data_path: Path | None,
-    train_indices: torch.Tensor,
-    test_indices: torch.Tensor,
-) -> tuple[pl.DataFrame, pl.DataFrame]:
-    data_handler = DataProcessing()
-    if data_path is not None:
-        data_handler.excel_path = data_path
-
-    df = data_handler.load_shipping_data(data_handler.excel_path)
-    df = data_handler._geolocate_nodes(df)
-    df = data_handler._calculate_distance(df)
-
-    train_frame = df[train_indices.cpu().numpy().tolist()]
-    test_frame = df[test_indices.cpu().numpy().tolist()]
-    return train_frame, test_frame
-
-
-def _explode_airline_names(frame: pl.DataFrame, airline_col: str = "Airline") -> pl.DataFrame:
-    if airline_col not in frame.columns:
-        raise ValueError(f"Expected '{airline_col}' to be present in the data frame.")
-
-    return (
-        frame
-        .select(pl.all())
-        .with_columns(
-            pl.col(airline_col)
-            .cast(pl.Utf8)
-            .str.split(",")
-            .alias("airline_name")
-        )
-        .explode("airline_name")
-        .with_columns(pl.col("airline_name").str.strip_chars())
-        .filter(pl.col("airline_name").is_not_null() & (pl.col("airline_name") != ""))
-    )
-
-
-def _build_airline_price_profile(train_frame: pl.DataFrame) -> tuple[dict[str, float], float, int]:
-    weight_column_candidates = ["shipment_weight_kg", "AW (kg)"]
-    weight_column = next((c for c in weight_column_candidates if c in train_frame.columns), None)
-
-    required_columns = {"Airline", "Commercial Cost for Long-Haul", "distance"}
-    missing_columns = sorted(required_columns.difference(train_frame.columns))
-    if missing_columns:
-        raise ValueError(f"Cannot build airline price profile; missing columns: {missing_columns}")
-    if weight_column is None:
-        raise ValueError(
-            "Cannot build airline price profile; missing shipment weight column. "
-            f"Expected one of {weight_column_candidates}."
+    if args.prepare:
+        prepared = ProblemPreparer(config).prepare()
+        args.prepared_problem.parent.mkdir(parents=True, exist_ok=True)
+        with args.prepared_problem.open("wb") as output_file:
+            pickle.dump(prepared, output_file, protocol=pickle.HIGHEST_PROTOCOL)
+        print(
+            f"Prepared {len(prepared.shipments)} shipments, {len(prepared.legs)} legs, "
+            f"and {prepared.num_scenarios} shared scenarios."
         )
 
-    priced_rows = (
-        _explode_airline_names(
-            train_frame.select(["Airline", "Commercial Cost for Long-Haul", "distance", weight_column]),
-            airline_col="Airline",
-        )
-        .with_columns([
-            pl.col("Commercial Cost for Long-Haul")
-            .cast(pl.Utf8)
-            .str.replace_all(",", "")
-            .cast(pl.Float64, strict=False)
-            .alias("long_haul_cost"),
-            pl.col("distance").cast(pl.Utf8).str.replace_all(",", "").cast(pl.Float64, strict=False).alias("distance_km"),
-            pl.col(weight_column).cast(pl.Utf8).str.replace_all(",", "").cast(pl.Float64, strict=False).alias("shipment_weight_kg"),
-        ])
-        .with_columns((pl.col("distance_km") * 0.621371).alias("distance_miles"))
-        .filter(
-            pl.col("long_haul_cost").is_not_null()
-            & pl.col("distance_miles").is_not_null()
-            & pl.col("shipment_weight_kg").is_not_null()
-            & (pl.col("long_haul_cost") > 0)
-            & (pl.col("distance_miles") > 0)
-            & (pl.col("shipment_weight_kg") > 0)
-        )
-        .with_columns((pl.col("long_haul_cost") / (pl.col("distance_miles") * pl.col("shipment_weight_kg"))).alias("price_per_mile_kg"))
-    )
-
-    # print(priced_rows.head(5))
-    # sys.exit(0)
-
-    if priced_rows.is_empty():
-        raise ValueError("No valid airline pricing rows remained after cleaning training data.")
-
-    airline_mean_price_per_mile = (
-        priced_rows
-        .group_by("airline_name")
-        .agg(pl.col("price_per_mile_kg").mean().alias("mean_price_per_mile"))
-        .sort("airline_name")
-    )
-
-    # print(airline_mean_price_per_mile.head(5))
-    # sys.exit(0)
-
-    airline_price_map = {
-        str(row[0]): float(row[1])
-        for row in airline_mean_price_per_mile.select(["airline_name", "mean_price_per_mile"]).iter_rows()
-    }
-    if not airline_price_map:
-        raise ValueError("No airline price-per-mile statistics could be computed.")
-
-    global_mean_price_per_mile = float(priced_rows.select(pl.col("price_per_mile_kg").mean()).item())
-    if not np.isfinite(global_mean_price_per_mile) or global_mean_price_per_mile <= 0:
-        raise ValueError(f"Invalid global mean price-per-mile computed: {global_mean_price_per_mile}")
-
-    return airline_price_map, global_mean_price_per_mile, int(priced_rows.height)
-
-
-def _build_shipments_and_features(
-    split_features: torch.Tensor,
-    test_indices: torch.Tensor,
-    test_frame: pl.DataFrame,
-) -> tuple[list[Shipment], dict[str, np.ndarray], dict[str, float], dict[str, float], dict[str, int]]:
-    shipments: list[Shipment] = []
-    feature_by_shipment: dict[str, np.ndarray] = {}
-    weight_by_shipment: dict[str, float] = {}
-    pallets_by_shipment: dict[str, float] = {}
-    observed_config_by_shipment: dict[str, int] = {}
-
-    test_features_np = split_features[test_indices].detach().cpu().numpy().astype(np.float32)
-    rows = test_frame.iter_rows(named=True)
-
-    for idx, (row, feat) in enumerate(zip(rows, test_features_np)):
-
-        shipment_id = f"S{idx:04d}"
-        weight = float(row.get("AW (kg)", 0.0) or 0.0)
-        pallets = float(row.get("Pallets", 0.0) or 0.0)
-        origin = str(row.get("Origin", ""))
-        destination = str(row.get("Destination", ""))
-        observed_config = str(row.get("Aircraft Type", ""))
-
-        shipments.append(
-            Shipment(
-                shipment_id=shipment_id,
-                weight_kg=weight,
-                origin=origin,
-                destination=destination,
-                pallets=pallets,
-                equivalent_cost=max(0.0, 0.15 * weight),
-                commodity="humanitarian",
-            )
-        )
-        feature_by_shipment[shipment_id] = feat
-        weight_by_shipment[shipment_id] = weight
-        pallets_by_shipment[shipment_id] = pallets
-        observed_config_by_shipment[shipment_id] = _config_index(observed_config)
-
-    return shipments, feature_by_shipment, weight_by_shipment, pallets_by_shipment, observed_config_by_shipment
-
-
-def _build_flights(
-    train_frame: pl.DataFrame,
-    test_frame: pl.DataFrame,
-    rng: np.random.Generator,
-    airline_price_per_mile: dict[str, float],
-    global_mean_price_per_mile: float,
-    airlines_per_route: int = 3,
-) -> tuple[list[FlightOption], int]:
-    routes = (
-        test_frame.select(["Origin", "Destination", "distance"]).drop_nulls().unique().sort(["Origin", "Destination"])
-    )
-
-    global_airlines = _explode_airline_names(train_frame, airline_col="Airline").select("airline_name").unique().to_series().to_list()
-    global_airlines = [str(a) for a in global_airlines]
-    if not global_airlines:
-        raise ValueError("No airlines were found in the training split to bootstrap test flights.")
-
-    flights: list[FlightOption] = []
-    # NOTE use for testing
-    fallback_cost_count = 0
-
-    for route_idx, route in enumerate(routes.iter_rows(named=True)):
-
-        origin = str(route["Origin"])
-        destination = str(route["Destination"])
-        distance_km = float(route["distance"])
-        distance_miles = distance_km * 0.621371
-
-        route_airlines = (
-            _explode_airline_names(
-                train_frame.filter((pl.col("Origin") == origin) & (pl.col("Destination") == destination)),
-                airline_col="Airline",
-            )
-            .select("airline_name")
-            .unique()
-            .to_series()
-            .to_list()
-        )
-        route_airlines = [str(a) for a in route_airlines]
-
-        # NOTE new bandaid fix, sometimes have 1 airline op on rt so need to shift to global
-        pool = route_airlines if (route_airlines and len(route_airlines) != 1) else global_airlines
-
-        n_sample = min(airlines_per_route, len(pool))
-        if n_sample == 1:
-            raise Exception(
-                f"Only one airline '{pool[0]}' found for route {origin} -> {destination}. Consider reducing airlines_per_route or ensuring more airline diversity in the training split."
-            )
-        sampled_airlines = rng.choice(pool, size=n_sample, replace=False).tolist()
-
-        for airline_id in sampled_airlines:
-            price_per_mile = airline_price_per_mile.get(airline_id, global_mean_price_per_mile)
-            if airline_id not in airline_price_per_mile:
-                fallback_cost_count += 1
-            if not np.isfinite(price_per_mile) or price_per_mile <= 0:
-                raise ValueError(
-                    f"Invalid price-per-mile for airline '{airline_id}': {price_per_mile}."
-                )
-            flights.append(
-                FlightOption(
-                    route_id=f"R{route_idx:03d}",
-                    airline_id=airline_id,
-                    origin=origin,
-                    destination=destination,
-                    distance_miles=distance_miles,
-                    cost_flight=price_per_mile * distance_miles,
-                )
-            )
-
-    return flights, fallback_cost_count
-
-# NOTE bootleg fix
-split = None
-train_frame = None
-test_frame = None
-def _train_predictive_models(args):
-    global split, train_frame, test_frame
-    configure_determinism(args.seed)
-    rng = np.random.default_rng(args.seed)
-
-    split = build_shared_split(data_path=args.data, train_ratio=args.train_ratio, seed=args.seed)
-
-    # Train NCE acceptance predictor on the training set.
-    print("Training NCE acceptance predictor...")
-    nce_trainer = TrainNCE(split.train_features, split.test_features)
-    nce_study = nce_trainer.run_optimization(n_trials=args.nce_trials)
-    nce_model = nce_trainer.train_final_model(nce_study.best_trial.params)
-    nce_network: Any = nce_model.model
-    noise_gen = NoiseGeneration(split.train_features, inflation=1.5)
-
-    # Train aircraft configuration predictor on the training set.
-    print("Training aircraft configuration predictor...")
-    torch_mnlr, _, _ = train_torch_mnlr(
-        split,
-        verbose=args.config_verbose,
-        log_every=args.config_log_every,
-    )
-    aircraft_compat_model = MultinomialLogitAircraftModel(
-        coef_=torch_mnlr.linear.weight.detach().cpu().numpy(),
-        intercept_=torch_mnlr.linear.bias.detach().cpu().numpy(),
-        classes_=split.label_names,
-    )
-
-    # Define training and testing frames
-    train_frame, test_frame = _load_split_frames(args.data, split.train_indices, split.test_indices)
-
-    # Build airline price profile from training data
-    airline_price_per_mile, global_mean_price_per_mile, pricing_rows = _build_airline_price_profile(train_frame)
-
-    # Build shipments from test set
-    shipments, feature_by_shipment, weight_by_shipment, pallets_by_shipment, observed_config_by_shipment = _build_shipments_and_features(
-        split.features,
-        split.test_indices,
-        test_frame,
-    )
-
-    # Build flight options from test set and airline price profile
-    # NOTE: this will be replaced by T100 flight and multimodal options
-    flights, fallback_cost_count = _build_flights(
-            train_frame,
-            test_frame,
-            rng=rng,
-            airline_price_per_mile=airline_price_per_mile,
-            global_mean_price_per_mile=global_mean_price_per_mile,
-        )
-        
-    # 
-    shipment_ids = [shipment.shipment_id for shipment in shipments]
-    shipment_features = np.stack([feature_by_shipment[shipment_id] for shipment_id in shipment_ids], axis=0)
-
-    # NCE evaluation
-    nce_device = next(nce_network.parameters()).device
-    shipment_feature_tensor = torch.as_tensor(shipment_features, dtype=torch.float32, device=nce_device)
-
-    # nce_batch_start = time.perf_counter()
-    with torch.no_grad():
-        nce_scores = nce_network(shipment_feature_tensor).squeeze(-1)
-        nce_noise_log_prob = noise_gen.log_prob(shipment_feature_tensor)
-        accept_prob_tensor = torch.sigmoid(nce_scores - nce_noise_log_prob)
-        accept_prob_tensor = torch.clamp(accept_prob_tensor, 1e-4, 0.9999)
-    # nce_batch_seconds = time.perf_counter() - nce_batch_start
-    accept_prob_by_shipment = {
-        shipment_id: float(accept_prob_tensor[idx].item())
-        for idx, shipment_id in enumerate(shipment_ids)
-    }
-
-    # save to pkl
-    with open("predictive-elements.pkl", "wb") as f:
-        pkl.dump(
-            {
-                "shipments": shipments,
-                "flights": flights,
-                # "split": split,
-                "observed_config_by_shipment": observed_config_by_shipment,
-                "feature_by_shipment": feature_by_shipment,
-                "accept_prob_by_shipment": accept_prob_by_shipment,
-                "aircraft_compat_model": aircraft_compat_model,
-                "rng": rng,
-            },
-            f
+        print(
+            f"Saved prepared problem to {args.prepared_problem}"
         )
 
-    return shipments, flights, observed_config_by_shipment, feature_by_shipment, accept_prob_by_shipment, aircraft_compat_model, rng
+        return
 
+    if args.merge:
+        results = [
+            json.loads(path.read_text())
+            for path in sorted(args.output_dir.glob("run_*.json"))
+        ]
+        summary_path = args.output_dir / "summary.json"
+        summary_path.write_text(json.dumps(results, indent=2, allow_nan=False))
+        print(f"Merged {len(results)} results into {summary_path}")
+        return
 
-def main() -> tuple[Any, Any]:
-    args = _parse_args()
+    with args.prepared_problem.open("rb") as input_file:
+        prepared = pickle.load(input_file)
 
-    if args.retrain:
-        print("Retraining models from scratch...")
+    run_index = args.run_index
+    if run_index is None:
+        run_index = int(os.environ["SLURM_ARRAY_TASK_ID"])
 
-        shipments, flights, observed_config_by_shipment, feature_by_shipment, accept_prob_by_shipment, aircraft_compat_model, rng = _train_predictive_models(args)    
-       
-        # print(f"Built {len(shipments)} shipments and extracted features, weights, pallets, and observed configs for each shipment.")
-        
-        # print(
-        #     f"Flight pricing diagnostics: airlines_with_stats={len(airline_price_per_mile)}, "
-        #     f"pricing_rows={pricing_rows}, global_mean_ppm={global_mean_price_per_mile:.4f}, "
-        #     f"fallback_flights={fallback_cost_count}"
-        # )
-
-        # if not shipments:
-        #     raise ValueError("No feasible shipments remain after enforcing OD arc restrictions.")
-        # if not flights:
-        #         raise ValueError("No flight options were built from the test split.")
-
-
-        # Define shipment features tensor for NCE evaluation    
-    else:
-        with open("predictive-elements.pkl", "rb") as f:
-            predictive_elements = pkl.load(f)
-
-        shipments = predictive_elements["shipments"]
-        flights = predictive_elements["flights"]
-        # split = predictive_elements["split"]
-        observed_config_by_shipment = predictive_elements["observed_config_by_shipment"]
-        feature_by_shipment = predictive_elements["feature_by_shipment"]
-        accept_prob_by_shipment = predictive_elements["accept_prob_by_shipment"]
-        aircraft_compat_model = predictive_elements["aircraft_compat_model"]
-        rng = predictive_elements["rng"]
-
-
-
-    print("Building scenarios...")
-    # scenario_build_start = time.perf_counter()
-    scenarios: list[list[UncertaintyRealization]] = []
-    for _ in range(args.n_scenarios):
-        scenario: list[UncertaintyRealization] = []
-        for shipment in shipments:
-            observed_idx = observed_config_by_shipment[shipment.shipment_id]
-            base_feat = feature_by_shipment[shipment.shipment_id]
-            accept_prob = accept_prob_by_shipment[shipment.shipment_id]
-
-            for flight in flights:
-                accepted = bool(rng.binomial(1, accept_prob))
-
-                compatibility = False
-                if accepted:
-                    realized_class, _, _ = aircraft_compat_model.sample(base_feat, rng=rng)
-                    realized_idx = _config_index(realized_class)
-                    compatibility = realized_idx >= observed_idx
-
-                scenario.append(
-                    UncertaintyRealization(
-                        shipment_id=shipment.shipment_id,
-                        flight_id=f"{flight.route_id}_{flight.airline_id}",
-                        acceptance=accepted,
-                        compatibility=compatibility,
-                    )
-                )
-        scenarios.append(scenario)
-    # scenario_build_seconds = time.perf_counter() - scenario_build_start
-
-    print(f"Built {len(scenarios)} scenarios with acceptance and compatibility realizations for each shipment-flight pair.")
-    # print(
-    #     f"NCE batch evaluation took {nce_batch_seconds:.2f}s; scenario construction took {scenario_build_seconds:.2f}s"
-    # )
-
-    # \ra
-    PARAMS = StochasticOptimizationParameters(
-        cost_penalty_rejection=50000.0,
-        cost_penalty_incompatibility=0.0,
-        cost_reassignment=12000.0,
-    )
-
-    solver = TwoStageSolver(shipments, flights, PARAMS)
-    print("Solving SAA problem...")
-
-    saa_solution, mod = solver.solve_sample_average(scenarios=scenarios)
-    # accepted_counts = [
-    #     sum(1 for ur in scenario if ur.acceptance) for scenario in scenarios
-    # ]
-    # compat_counts = [
-    #     sum(1 for ur in scenario if ur.compatibility) for scenario in scenarios
-    # ]
-
-    # print("=== Integrated SAA Run ===")
-    # print(
-    #     f"Data split: train={len(split.train_indices)}, test={len(split.test_indices)}, "
-    #     f"ratio={split.train_ratio:.2f}/{1 - split.train_ratio:.2f}, seed={split.seed}"
-    # )
-    # print(f"Optimization entities: shipments={len(shipments)}, flights={len(flights)}, scenarios={len(scenarios)}")
-    # print(f"Scenario diagnostics: avg_acceptances={np.mean(accepted_counts):.1f}, avg_compatibilities={np.mean(compat_counts):.1f}")
-
-    # print(f"Solver status: {saa_solution.first_stage.status}")
-    # print(f"First-stage objective: {saa_solution.first_stage.objective_value:,.2f}")
-    # if saa_solution.second_stage is not None:
-    #     print(f"Expected recourse: {saa_solution.second_stage.objective_value:,.2f}")
-    # print(f"Total expected cost: {saa_solution.expected_total_cost:,.2f}")
-
-    # print("Top first-stage assignments:")
-    # shown = 0
-    # for (shipment_id, flight_id), value in sorted(saa_solution.first_stage.assignments.items()):
-    #     if value > 0.5:
-    #         print(f"  {shipment_id} -> {flight_id}")
-    #         shown += 1
-    #         if shown >= 20:
-    #             break
-
-    # print("Top second stage reassignments (if any):")
-    # if saa_solution.second_stage is not None:
-    #     shown = 0
-    #     for (shipment_id, flight_id), value in sorted(saa_solution.second_stage.reassignments.items()):
-    #         if value > 0.5:
-    #             print(f"  {shipment_id} -> {flight_id}")
-    #             shown += 1
-    #             if shown >= 20:
-    #                 break
-
-        # print("Myopic Run")
-    myopic_solution, mod2 = solver.solve_myopic(scenarios=scenarios)
-
-    # Diagnostics from exact binary decision variables in the solved models.
-    incompatible_lookup = {
-        (ur.shipment_id, ur.flight_id, om)
-        for om, scenario in enumerate(scenarios)
-        for ur in scenario
-        if ur.acceptance and not ur.compatibility
-    }
-
-    def _parse_triplet_var_name(var_name: str) -> tuple[str, str, int] | None:
-        start = var_name.find("[")
-        end = var_name.rfind("]")
-        if start == -1 or end == -1 or end <= start + 1:
-            return None
-        parts = [p.strip() for p in var_name[start + 1:end].split(",", 2)]
-        if len(parts) != 3:
-            return None
-        try:
-            return parts[0], parts[1], int(parts[2])
-        except ValueError:
-            return None
-
-    def _totals_from_model(model) -> tuple[int, int]:
-        total_reassignments = 0
-        total_incompatibles = 0
-        for var in model.getVars():
-            if var.X <= 0.5:
-                continue
-
-            parsed = _parse_triplet_var_name(var.VarName)
-            if parsed is None:
-                continue
-            shipment_id, flight_id, om = parsed
-            key = (shipment_id, flight_id, om)
-
-            if var.VarName.startswith("reassign["):
-                total_reassignments += 1
-                if key in incompatible_lookup:
-                    total_incompatibles += 1
-            elif var.VarName.startswith("keep["):
-                if key in incompatible_lookup:
-                    total_incompatibles += 1
-
-        return total_reassignments, total_incompatibles
-
-    saa_total_reassignments, saa_total_incompatibilities = _totals_from_model(mod)
-    myopic_total_reassignments, myopic_total_incompatibilities = _totals_from_model(mod2)
-    
-    #     total_costs.append((saa_solution.expected_total_cost, myopic_solution.expected_total_cost))
-    #     first_stage_costs.append((saa_solution.first_stage.objective_value, myopic_solution.first_stage.objective_value))
-    #     second_stage_costs.append((saa_solution.second_stage.objective_value, myopic_solution.second_stage.objective_value))
-
-    # avg_total_costs = np.mean(total_costs, axis=0)
-    # avg_first_stage_costs = np.mean(first_stage_costs, axis=0)
-    # avg_second_stage_costs = np.mean(second_stage_costs, axis=0)
-
-    # print(f"Myopic solver status: {myopic_solution.first_stage.status}")
-    # print(f"Myopic first-stage objective: {myopic_solution.first_stage.objective_value:,.2f}")
-    # print(f"Myopic expected recourse: {myopic_solution.second_stage.objective_value:,.2f}")
-    # print(f"Myopic total expected cost: {myopic_solution.expected_total_cost:,.2f}")
-
-    # Comparing the two results
-    print("\n=== Solution Comparison ===")
-    print(f"SAA expected total cost: {saa_solution.expected_total_cost:,.2f}")
-    print(f"Myopic total expected cost: {myopic_solution.expected_total_cost:,.2f}")
-    print(f"Cost difference (Myopic - SAA): {myopic_solution.expected_total_cost - saa_solution.expected_total_cost:,.2f}")
-    print(f"Percent reduction: {100.0 * (saa_solution.expected_total_cost - myopic_solution.expected_total_cost) / myopic_solution.expected_total_cost:.2f}%")
-    print("First stage difference (Myopic - SAA):", (myopic_solution.first_stage.objective_value - saa_solution.first_stage.objective_value))
-    print("Second stage difference (Myopic - SAA):", (myopic_solution.second_stage.objective_value - saa_solution.second_stage.objective_value))
-
-    print("\n=== Totals By Model ===")
-    print(f"SAA total reassignments: {saa_total_reassignments}")
-    print(f"SAA total incompatible flights: {saa_total_incompatibilities}")
-    print(f"Myopic total reassignments: {myopic_total_reassignments}")
-    print(f"Myopic total incompatible flights: {myopic_total_incompatibilities}")
-
-    # Historic assignments represented as one variable per Origin-Destination-Airline triplet.
-    route_airline_triplets: set[tuple[str, str, str]] = set()
-    global train_frame, test_frame
-    for frame in (train_frame, test_frame):
-        if frame is None:
-            continue
-        for row in frame.iter_rows(named=True):
-            origin = str(row.get("Origin", ""))
-            destination = str(row.get("Destination", ""))
-            airline = str(row.get("Airline", ""))
-            if not origin or not destination or not airline:
-                continue
-            for airline_name in airline.split(","):
-                airline_name = airline_name.strip()
-                if airline_name:
-                    route_airline_triplets.add((origin, destination, airline_name))
-
-    # Build shipment -> (origin, destination) lookup without relying on global frames.
-    shipment_route_by_id = {
-        shipment.shipment_id: (shipment.origin, shipment.destination)
-        for shipment in shipments
-    }
-
-    # compare the historic triplets with the SAA and Myopic assignments
-    def _extract_assignments(solution, shipment_routes: dict[str, tuple[str, str]]) -> set[tuple[str, str, str]]:
-        assignments: set[tuple[str, str, str]] = set()
-        for (shipment_id, flight_id), value in solution.first_stage.assignments.items():
-            if value > 0.5:
-                _, airline_id = flight_id.split("_", 1)
-                route = shipment_routes.get(shipment_id)
-                if route is not None:
-                    origin, destination = route
-                    assignments.add((origin, destination, airline_id))
-        return assignments
-    
-    saa_assignments = _extract_assignments(saa_solution, shipment_route_by_id)
-    myopic_assignments = _extract_assignments(myopic_solution, shipment_route_by_id)
-
-    historic_assignments = route_airline_triplets
-
-    print("\n=== Assignment Comparison ===")
-    print(f"Historic assignments: {len(historic_assignments)}")
-    print(f"SAA assignments: {len(saa_assignments)}")
-    print(f"Myopic assignments: {len(myopic_assignments)}")
-
-    print(f"Historic vs SAA overlap: {len(historic_assignments.intersection(saa_assignments))}")
-    print(f"Historic vs Myopic overlap: {len(historic_assignments.intersection(myopic_assignments))}")
-    print(f"SAA vs Myopic overlap: {len(saa_assignments.intersection(myopic_assignments))}")
-    return saa_solution, mod
+    result_path = SensitivityRunner(config, prepared).run(run_index, args.output_dir)
+    print(result_path)
 
 
 if __name__ == "__main__":
-    saa_solution, mod = main()
+    main()
