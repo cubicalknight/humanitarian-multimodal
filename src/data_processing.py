@@ -164,7 +164,8 @@ class DataProcessing:
 
     def _calculate_distance(self, df: pl.DataFrame) -> pl.DataFrame:
         # Standard Haversine formula implementation to calculate distance between two lat/lon points
-        R = 6371.0  # Earth's radius in km
+        # R = 6371.0  # Earth's radius in km
+        R = 3958.8  # Earth's radius in miles
 
         dlat = (pl.col("Destination_Lat") - pl.col("Origin_Lat")).radians()
         dlon = (pl.col("Destination_Lon") - pl.col("Origin_Lon")).radians()
@@ -176,7 +177,7 @@ class DataProcessing:
 
         c = 2 * a.sqrt().arcsin()
 
-        # NOTE this gives distance in km
+        # NOTE this gives distance in mi
         ret =  df.with_columns((c * R).alias("DISTANCE"))
 
         return ret
