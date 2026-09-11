@@ -143,9 +143,7 @@ class StochasticOptimizationParameters:
     cost_flight: float
     cost_ground: float
 
-    # Cost parameters
-    cost_penalty_rejection: float  # c_pt: penalty for carrier rejection
-    cost_penalty_incompatibility: float  # Penalty for aircraft incompatibility
+    cost_penalty_incompatibility: float  # Penalty for flight incompatibility
     
     # These can be overridden per route/airline
     cost_reassignment: float | None = None  # Difference (c_flight' - c_flight)
@@ -236,7 +234,7 @@ class TwoStageSolver:
                 self.params.get_reassignment_cost(
                     self.params.cost_flight if route[2] == "air" else self.params.cost_ground
                 )
-                + self.params.cost_penalty_rejection
+                + self.params.cost_penalty_incompatibility
             )
             * self.legs[route].distance_miles
             for route in self.R
@@ -420,9 +418,9 @@ class TwoStageSolver:
                     model.addConstr(flow_out - flow_in == rhs, name=f"flow_constraint_{l}")
 
         cost = gp.quicksum(
-            reassign[s, i, j, m, om] * (self.params.get_reassignment_cost(self.params.cost_flight) + self.params.cost_penalty_rejection)
+            reassign[s, i, j, m, om] * (self.params.get_reassignment_cost(self.params.cost_flight) + self.params.cost_penalty_incompatibility)
             if m == "air"
-            else reassign[s, i, j, m, om] * (self.params.get_reassignment_cost(self.params.cost_ground) + self.params.cost_penalty_rejection)
+            else reassign[s, i, j, m, om] * (self.params.get_reassignment_cost(self.params.cost_ground) + self.params.cost_penalty_incompatibility)
             for s in self.S
             for i, j, m in self.R
             for om in Omega
@@ -1189,7 +1187,6 @@ if __name__ == "__main__":
         params=StochasticOptimizationParameters(
             cost_flight=4.0,
             cost_ground=2.0,
-            cost_penalty_rejection=10.0,
             cost_penalty_incompatibility=5.0,
         ),
     )
