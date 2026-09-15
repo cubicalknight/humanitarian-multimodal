@@ -22,6 +22,8 @@ import signal
 import tracemalloc
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from heapq import heappop, heappush
+from itertools import count
 from math import cos, radians, sin
 from pathlib import Path
 
@@ -126,6 +128,170 @@ class Shipment:
     commodity: str | None = None
 
 
+RouteKey = tuple[str, str, str]
+RoutePath = tuple[RouteKey, ...]
+
+
+def _shortest_route_path(
+    origin: str,
+    destination: str,
+    outgoing: dict[str, tuple[RouteKey, ...]],
+    legs: dict[RouteKey, LegOption],
+    banned_nodes: frozenset[str] = frozenset(),
+    banned_routes: frozenset[RouteKey] = frozenset(),
+) -> RoutePath | None:
+    """Return one deterministic shortest simple path under Yen exclusions."""
+    if origin in banned_nodes or destination in banned_nodes:
+        return None
+    if origin == destination:
+        return ()
+
+    sequence = count()
+    queue: list[tuple[float, int, str, RoutePath, frozenset[str]]] = [
+        (0.0, next(sequence), origin, (), frozenset((origin,)))
+    ]
+    best_distance = {origin: 0.0}
+
+    while queue:
+        distance, _, node, path, path_nodes = heappop(queue)
+        if distance > best_distance.get(node, math.inf):
+            continue
+        if node == destination:
+            return path
+
+        for route in outgoing.get(node, ()):
+            next_node = route[1]
+            if (
+                route in banned_routes
+                or next_node in banned_nodes
+                or next_node in path_nodes
+            ):
+                continue
+            next_distance = distance + legs[route].distance_miles
+            if next_distance >= best_distance.get(next_node, math.inf):
+                continue
+            best_distance[next_node] = next_distance
+            heappush(
+                queue,
+                (
+                    next_distance,
+                    next(sequence),
+                    next_node,
+                    path + (route,),
+                    path_nodes | {next_node},
+                ),
+            )
+
+    return None
+
+
+def k_shortest_route_paths(
+    legs: dict[RouteKey, LegOption],
+    origin: str,
+    destination: str,
+    max_paths: int = 10,
+) -> tuple[RoutePath, ...]:
+    """Return up to ``max_paths`` shortest loopless directed edge paths.
+
+    This is Yen's algorithm over route keys rather than node pairs, so parallel
+    air and ground legs between the same nodes remain distinct alternatives.
+    """
+    if max_paths <= 0:
+        raise ValueError("max_paths must be positive")
+
+    outgoing_lists: dict[str, list[RouteKey]] = {}
+    for route, leg in legs.items():
+        if not math.isfinite(leg.distance_miles) or leg.distance_miles < 0:
+            raise ValueError(f"Route {route!r} has an invalid distance")
+        outgoing_lists.setdefault(route[0], []).append(route)
+    outgoing = {
+        node: tuple(sorted(routes, key=lambda route: (route[1], route[2], route[0])))
+        for node, routes in outgoing_lists.items()
+    }
+
+    first_path = _shortest_route_path(origin, destination, outgoing, legs)
+    if first_path is None:
+        return ()
+
+    accepted: list[RoutePath] = [first_path]
+    accepted_set = {first_path}
+    candidates: list[tuple[float, RoutePath]] = []
+    candidate_set: set[RoutePath] = set()
+
+    while len(accepted) < max_paths:
+        previous_path = accepted[-1]
+        previous_nodes = (origin,) + tuple(route[1] for route in previous_path)
+
+        for spur_index in range(len(previous_path)):
+            root_path = previous_path[:spur_index]
+            spur_node = previous_nodes[spur_index]
+            removed_routes = frozenset(
+                path[spur_index]
+                for path in accepted
+                if len(path) > spur_index and path[:spur_index] == root_path
+            )
+            removed_nodes = frozenset(previous_nodes[:spur_index])
+            spur_path = _shortest_route_path(
+                spur_node,
+                destination,
+                outgoing,
+                legs,
+                banned_nodes=removed_nodes,
+                banned_routes=removed_routes,
+            )
+            if spur_path is None:
+                continue
+
+            candidate = root_path + spur_path
+            if candidate in accepted_set or candidate in candidate_set:
+                continue
+            candidate_cost = sum(legs[route].distance_miles for route in candidate)
+            heappush(candidates, (candidate_cost, candidate))
+            candidate_set.add(candidate)
+
+        if not candidates:
+            break
+        _, next_path = heappop(candidates)
+        candidate_set.remove(next_path)
+        accepted.append(next_path)
+        accepted_set.add(next_path)
+
+    return tuple(accepted)
+
+
+def build_feasible_routes_by_shipment(
+    shipments: dict[str, Shipment],
+    legs: dict[RouteKey, LegOption],
+    max_paths: int = 10,
+) -> dict[str, tuple[RouteKey, ...]]:
+    """Build each shipment's ordered union of routes from its K shortest paths."""
+    paths_by_od: dict[tuple[str, str], tuple[RoutePath, ...]] = {}
+    feasible: dict[str, tuple[RouteKey, ...]] = {}
+
+    for shipment_id, shipment in shipments.items():
+        od = (shipment.origin.node_id, shipment.destination.node_id)
+        paths = paths_by_od.get(od)
+        if paths is None:
+            paths = k_shortest_route_paths(legs, *od, max_paths=max_paths)
+            paths_by_od[od] = paths
+        if not paths or not any(paths):
+            raise ValueError(
+                f"No directed route path for shipment {shipment_id!r} from "
+                f"{od[0]!r} to {od[1]!r}"
+            )
+
+        seen: set[RouteKey] = set()
+        ordered_routes: list[RouteKey] = []
+        for path in paths:
+            for route in path:
+                if route not in seen:
+                    seen.add(route)
+                    ordered_routes.append(route)
+        feasible[shipment_id] = tuple(ordered_routes)
+
+    return feasible
+
+
 @dataclass(slots=True)
 class UncertaintyRealization:
     """
@@ -158,7 +324,7 @@ class StochasticOptimizationParameters:
             return max(0.0, new_cost - original_cost)
         if self.cost_reassignment is not None:
             return self.cost_reassignment
-        return original_cost * 0.5  # Default: 50% markup on reassignment
+        raise ValueError("Reassignment cost is not defined and no new cost provided.")
 
 
 @dataclass(slots=True)
@@ -203,10 +369,12 @@ class TwoStageSolver:
     def __init__(
         self,
         shipments: dict[str, Shipment],
-        legs: dict[tuple[str, str, str], LegOption],
+        legs: dict[RouteKey, LegOption],
         # nodes: dict[str, Node],
         params: StochasticOptimizationParameters,
         solver_quiet: bool = False,
+        feasible_routes_by_shipment: dict[str, Sequence[RouteKey]] | None = None,
+        recourse_path_limit: int = 20,
     ):
         self.shipments = shipments
         self.legs = legs
@@ -229,6 +397,77 @@ class TwoStageSolver:
             node: tuple(route for route in self.R if route[1] == node)
             for node in self.nodes
         }
+        if feasible_routes_by_shipment is None:
+            feasible_routes_by_shipment = build_feasible_routes_by_shipment(
+                shipments,
+                legs,
+                max_paths=recourse_path_limit,
+            )
+
+        route_set = set(self.R)
+        self.feasible_by_shipment: dict[str, tuple[RouteKey, ...]] = {}
+        self.feasible_route_sets: dict[str, frozenset[RouteKey]] = {}
+        self.feasible_nodes: dict[str, tuple[str, ...]] = {}
+        self.feasible_outgoing: dict[str, dict[str, tuple[RouteKey, ...]]] = {}
+        self.feasible_incoming: dict[str, dict[str, tuple[RouteKey, ...]]] = {}
+        self.feasible_air_outgoing: dict[str, dict[str, tuple[RouteKey, ...]]] = {}
+        self.feasible_air_incoming: dict[str, dict[str, tuple[RouteKey, ...]]] = {}
+        self.feasible_ground: dict[str, tuple[RouteKey, ...]] = {}
+
+        for shipment_id in self.S:
+            if shipment_id not in feasible_routes_by_shipment:
+                raise ValueError(f"Missing feasible routes for shipment {shipment_id!r}")
+            routes = tuple(dict.fromkeys(feasible_routes_by_shipment[shipment_id]))
+            unknown_routes = set(routes) - route_set
+            if unknown_routes:
+                raise ValueError(
+                    f"Shipment {shipment_id!r} has unknown feasible routes: "
+                    f"{sorted(unknown_routes)!r}"
+                )
+            if not routes:
+                raise ValueError(f"Shipment {shipment_id!r} has no feasible routes")
+
+            nodes = tuple(dict.fromkeys(
+                node
+                for route in routes
+                for node in (route[0], route[1])
+            ))
+            outgoing_lists: dict[str, list[RouteKey]] = {}
+            incoming_lists: dict[str, list[RouteKey]] = {}
+            for route in routes:
+                outgoing_lists.setdefault(route[0], []).append(route)
+                incoming_lists.setdefault(route[1], []).append(route)
+            outgoing = {
+                node: tuple(node_routes)
+                for node, node_routes in outgoing_lists.items()
+            }
+            incoming = {
+                node: tuple(node_routes)
+                for node, node_routes in incoming_lists.items()
+            }
+            self.feasible_by_shipment[shipment_id] = routes
+            self.feasible_route_sets[shipment_id] = frozenset(routes)
+            self.feasible_nodes[shipment_id] = nodes
+            self.feasible_outgoing[shipment_id] = outgoing
+            self.feasible_incoming[shipment_id] = incoming
+            self.feasible_air_outgoing[shipment_id] = {
+                node: air_routes
+                for node, routes_from_node in outgoing.items()
+                if (air_routes := tuple(
+                    route for route in routes_from_node if route[2] == "air"
+                ))
+            }
+            self.feasible_air_incoming[shipment_id] = {
+                node: air_routes
+                for node, routes_to_node in incoming.items()
+                if (air_routes := tuple(
+                    route for route in routes_to_node if route[2] == "air"
+                ))
+            }
+            self.feasible_ground[shipment_id] = tuple(
+                route for route in routes if route[2] == "ground"
+            )
+
         self.route_reassignment_cost = {
             route: (
                 self.params.get_reassignment_cost(
@@ -287,6 +526,173 @@ class TwoStageSolver:
     
 
     def stage_two_setup(self, model, x, Omega, scenarios):
+        """Build recourse variables only on each shipment's feasible route set."""
+        print("Setting up second stage optimization...")
+
+        if self.solver_quiet:
+            model.Params.OutputFlag = 0
+            model.Params.LogToConsole = 0
+
+        model.Params.Threads = 8
+        omega = tuple(Omega)
+        required_air_routes = {
+            route
+            for routes in self.feasible_by_shipment.values()
+            for route in routes
+            if route[2] == "air"
+        }
+        missing_scenarios = required_air_routes - scenarios.keys()
+        if missing_scenarios:
+            raise ValueError(
+                "Missing uncertainty realizations for feasible air routes: "
+                f"{sorted(missing_scenarios)!r}"
+            )
+        if omega:
+            max_scenario = max(omega)
+            too_short = {
+                route: len(scenarios[route].scenario_realize)
+                for route in required_air_routes
+                if len(scenarios[route].scenario_realize) <= max_scenario
+            }
+            if too_short:
+                raise ValueError(
+                    "Insufficient uncertainty realizations for scenario index "
+                    f"{max_scenario}: {too_short!r}"
+                )
+
+        sparse_pairs = sum(len(self.feasible_by_shipment[s]) for s in self.S)
+        dense_pairs = len(self.S) * len(self.R)
+        reduction = 1.0 - sparse_pairs / dense_pairs if dense_pairs else 0.0
+        print(
+            "Second-stage shipment-route pairs: "
+            f"{sparse_pairs:,} sparse vs {dense_pairs:,} dense "
+            f"({reduction:.1%} reduction); "
+            f"{2 * sparse_pairs * len(omega):,} recourse variables."
+        )
+
+        def second_stage_indices():
+            return (
+                (s, *route, om)
+                for s in self.S
+                for route in self.feasible_by_shipment[s]
+                for om in omega
+            )
+
+        still_avail = model.addVars(
+            second_stage_indices(),
+            vtype=GRB.BINARY,
+            name="keep",
+        )
+        print("Keep variables added.")
+        mem("After adding keep variables")
+
+        reassign = model.addVars(
+            second_stage_indices(),
+            vtype=GRB.CONTINUOUS,
+            lb=0.0,
+            name="reassign",
+        )
+        print("Reassign variables added.")
+        mem("After adding reassign variables")
+
+        model.addConstrs(
+            (
+                still_avail[s, *route, om]
+                == x[s, *route]
+                * (
+                    scenarios[route].scenario_realize[om]
+                    >= self.shipments[s].weight
+                )
+                if route[2] == "air"
+                else still_avail[s, *route, om] <= x[s, *route]
+            )
+            for s in self.S
+            for route in self.feasible_by_shipment[s]
+            for om in omega
+        )
+
+        model.addConstrs(
+            
+                reassign[s, *route, om] + still_avail[s, *route, om] <= 1
+                for s in self.S
+                for route in self.feasible_by_shipment[s]
+                for om in omega
+            
+        )
+
+        # Retain the first-mile/last-mile linking constraints, but build their
+        # sums from pre-indexed shipment-specific arcs.
+        model.addConstrs(
+            
+                still_avail[s, *route, om] + reassign[s, *route, om]
+                == gp.quicksum(
+                    still_avail[s, *air_route, om]
+                    + reassign[s, *air_route, om]
+                    for air_route in self.feasible_air_outgoing[s].get(route[1], ())
+                )
+                for s in self.S
+                for route in self.feasible_ground[s]
+                if route[0] == self.shipments[s].origin.node_id
+                for om in omega
+            
+        )
+        model.addConstrs(
+            
+                still_avail[s, *route, om] + reassign[s, *route, om]
+                == gp.quicksum(
+                    still_avail[s, *air_route, om]
+                    + reassign[s, *air_route, om]
+                    for air_route in self.feasible_air_incoming[s].get(route[0], ())
+                )
+                for s in self.S
+                for route in self.feasible_ground[s]
+                if route[1] == self.shipments[s].destination.node_id
+                for om in omega
+            
+        )
+
+        for om in tqdm(
+            omega,
+            desc="Processing scenarios",
+            unit="scenario",
+            disable=self.solver_quiet,
+        ):
+            for s in self.S:
+                orig_s = self.shipments[s].origin.node_id
+                dest_s = self.shipments[s].destination.node_id
+                for node in self.feasible_nodes[s]:
+                    flow_out = gp.quicksum(
+                        still_avail[s, *route, om] + reassign[s, *route, om]
+                        for route in self.feasible_outgoing[s].get(node, ())
+                    )
+                    flow_in = gp.quicksum(
+                        still_avail[s, *route, om] + reassign[s, *route, om]
+                        for route in self.feasible_incoming[s].get(node, ())
+                    )
+                    rhs = 1 if node == orig_s else -1 if node == dest_s else 0
+                    model.addConstr(
+                        flow_out - flow_in == rhs,
+                        name=f"recourse_flow_{s}_{node}_om{om}",
+                    )
+
+        cost = gp.quicksum(
+            reassign[s, *route, om]
+            * (
+                self.params.get_reassignment_cost(
+                    self.params.cost_flight
+                    if route[2] == "air"
+                    else self.params.cost_ground
+                )
+                + self.params.cost_penalty_incompatibility
+            )
+            for s in self.S
+            for route in self.feasible_by_shipment[s]
+            for om in omega
+        )
+
+        return model, still_avail, reassign, cost
+
+    def _stage_two_setup_dense_legacy(self, model, x, Omega, scenarios):
         print("Setting up second stage optimization...")
 
         if self.solver_quiet:
@@ -1135,8 +1541,8 @@ if __name__ == "__main__":
 
     plot_all_nodes_gnd()
     # breakpoint()
-    from itertools import islice
-    shipments = dict(islice(shipments.items(), 5))  # Limit to first 10 shipments for testing
+    # from itertools import islice
+    # shipments = dict(islice(shipments.items(), 5))  # Limit to first 10 shipments for testing
 
     # TODO see if theres a more efficient way to handle the scenario generation, vectorize as needed
     """Load the theta values from a .npz file."""
