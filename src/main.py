@@ -1003,7 +1003,12 @@ class RouteLimitSensitivityRunner:
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.set_defaults(output_dir_explicit=False)
-    parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=Path("sensitivity_config.json"),
+        help="Configuration JSON, relative to src/ (default: sensitivity_config.json).",
+    )
     parser.add_argument(
         "--prepared-problem",
         type=Path,
