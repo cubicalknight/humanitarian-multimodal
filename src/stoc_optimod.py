@@ -311,21 +311,6 @@ class StochasticOptimizationParameters:
 
     cost_penalty_incompatibility: float  # Penalty for flight incompatibility
     
-    # These can be overridden per route/airline
-    cost_reassignment: float | None = None  # Difference (c_flight' - c_flight)
-
-    def get_reassignment_cost(
-        self,
-        original_cost: float,
-        new_cost: float | None = None,
-    ) -> float:
-        """Calculate reassignment cost as difference between new and original flights."""
-        if new_cost is not None:
-            return max(0.0, new_cost - original_cost)
-        if self.cost_reassignment is not None:
-            return self.cost_reassignment
-        raise ValueError("Reassignment cost is not defined and no new cost provided.")
-
 
 @dataclass(slots=True)
 class FirstStageSolution:
@@ -467,18 +452,6 @@ class TwoStageSolver:
             self.feasible_ground[shipment_id] = tuple(
                 route for route in routes if route[2] == "ground"
             )
-
-        self.route_reassignment_cost = {
-            route: (
-                self.params.get_reassignment_cost(
-                    self.params.cost_flight if route[2] == "air" else self.params.cost_ground
-                )
-                + self.params.cost_penalty_incompatibility
-            )
-            * self.legs[route].distance_miles
-            for route in self.R
-        }
-        # self.nodes = nodes
 
         self.solver_quiet = solver_quiet
 
@@ -675,16 +648,27 @@ class TwoStageSolver:
                         name=f"recourse_flow_{s}_{node}_om{om}",
                     )
 
+        # The first stage has already charged every selected route. For each
+        # scenario, charge the full replacement-route cost and refund the cost
+        # of each selected route that is not retained. Thus
+        # x[s, route] - still_avail[s, route, om] is the unused-assignment
+        # indicator represented by c'_{s,omega} in the formulation.
         cost = gp.quicksum(
             reassign[s, *route, om]
             * (
-                self.params.get_reassignment_cost(
-                    self.params.cost_flight
-                    if route[2] == "air"
-                    else self.params.cost_ground
-                )
+                self.shipments[s].weight
+                * self.legs[route].distance_miles
+                * (self.params.cost_flight if route[2] == "air" else self.params.cost_ground)
                 + self.params.cost_penalty_incompatibility
             )
+            - (x[s, *route] - still_avail[s, *route, om])
+            * (
+                self.params.cost_flight
+                if route[2] == "air"
+                else self.params.cost_ground
+            )
+            * self.shipments[s].weight
+            * self.legs[route].distance_miles
             for s in self.S
             for route in self.feasible_by_shipment[s]
             for om in omega
@@ -824,9 +808,17 @@ class TwoStageSolver:
                     model.addConstr(flow_out - flow_in == rhs, name=f"flow_constraint_{l}")
 
         cost = gp.quicksum(
-            reassign[s, i, j, m, om] * (self.params.get_reassignment_cost(self.params.cost_flight) + self.params.cost_penalty_incompatibility)
-            if m == "air"
-            else reassign[s, i, j, m, om] * (self.params.get_reassignment_cost(self.params.cost_ground) + self.params.cost_penalty_incompatibility)
+            (reassign[s, i, j, m, om]
+            * (
+                (self.params.cost_flight if m == "air" else self.params.cost_ground)
+                * self.shipments[s].weight
+                * self.legs[(i, j, m)].distance_miles
+                + self.params.cost_penalty_incompatibility
+            ))
+            - ((x[s, i, j, m] - still_avail[s, i, j, m, om])
+            * (self.params.cost_flight if m == "air" else self.params.cost_ground)
+            * self.shipments[s].weight
+            * self.legs[(i, j, m)].distance_miles)
             for s in self.S
             for i, j, m in self.R
             for om in Omega
