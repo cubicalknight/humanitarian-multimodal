@@ -8,5 +8,13 @@ src/predictive-elements.pkl
 /notebooks/sbi-logs
 *.png
 *.sbat
-*.out
+*.tfevents.*
 /run_outputs
+src/sbi-logs/
+/src/run_outputs
+*.npz
+*.csv
+*.pdf
+*.ilp
+/src/output
+/tests
