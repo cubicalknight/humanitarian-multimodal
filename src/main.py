@@ -1,12 +1,16 @@
-"""Run a Slurm-array cost sensitivity analysis for ``stoc_optimod``.
+"""Run cost or feasible-route sensitivity analyses for ``stoc_optimod``.
 
 Workflow:
 1. Run ``--prepare`` once to build the network and a shared scenario sample.
-2. Submit one Slurm array task per cost-parameter combination.
+2. Submit one Slurm array task per contiguous chunk of cost combinations.
 3. Run ``--merge`` after the array is complete to create one summary JSON file.
 
-Each array task reads the prepared problem and writes only its own result file.
-This avoids repeated data preparation and any concurrent writes to shared results.
+Each array task reads the prepared problem, builds one Gurobi model, and writes
+only its own result files. This avoids repeated data preparation, repeated model
+construction within a task, and concurrent writes to shared results.
+
+Use ``--k-sensitivity`` to independently prepare and solve the fixed feasible-
+route limits 35, 70, 100, 150 with the configured baseline cost parameters.
 """
 
 from __future__ import annotations
@@ -18,6 +22,7 @@ import json
 import os
 import pickle
 import sys
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -31,18 +36,22 @@ from data_processing import DataProcessing, T100DataProcessing
 from stoc_optimod import (
     LegOption,
     Node,
+    RouteKey,
     Shipment,
     StochasticOptimizationParameters,
     TwoStageSolver,
     UncertaintyRealization,
+    build_feasible_routes_by_shipment,
 )
 
 COST_FIELDS = (
     "cost_flight",
     "cost_ground",
     "cost_penalty_incompatibility",
-    "cost_reassignment",
 )
+
+# Sweep set for --k-sensitivity. Minimum is 35
+ROUTE_PATH_LIMITS = (35, 70, 100, 150)
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "seed": 42,
@@ -52,13 +61,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "cost_flight": 4.0,
         "cost_ground": 2.0,
         "cost_penalty_incompatibility": 5.0,
-        "cost_reassignment": None,
     },
     "parameter_values": {
         "cost_flight": [4.0],
         "cost_ground": [2.0],
         "cost_penalty_incompatibility": [5.0],
-        "cost_reassignment": [None],
     },
     "solver": {
         "threads": None,
@@ -70,6 +77,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "nearby_city_radius_miles": 100.0,
         "max_city_attempts": 10,
         "max_ground_distance_miles": 500.0,
+        "recourse_path_limit": 10,
     },
 }
 
@@ -90,6 +98,7 @@ class PreparedProblem:
     scenarios: dict[tuple[str, str, str], UncertaintyRealization]
     seed: int
     num_scenarios: int
+    feasible_routes_by_shipment: dict[str, tuple[RouteKey, ...]] | None = None
 
 
 def _merge_defaults(given: dict[str, Any], defaults: dict[str, Any]) -> dict[str, Any]:
@@ -112,7 +121,9 @@ class SensitivityConfig:
         self._validate()
 
     def _validate(self) -> None:
-        unknown_fields = set(self.data["parameter_values"]) - set(COST_FIELDS)
+        unknown_fields = (
+            set(self.data["parameter_values"]) | set(self.data["base_parameters"])
+        ) - set(COST_FIELDS)
         if unknown_fields:
             raise ValueError(f"Unknown cost fields: {sorted(unknown_fields)}")
 
@@ -123,10 +134,18 @@ class SensitivityConfig:
             )
             if not isinstance(values, list) or not values:
                 raise ValueError(f"parameter_values.{field} must be a non-empty list.")
-            if field != "cost_reassignment" and any(
+            if any(
                 value is None or float(value) < 0 for value in values
             ):
                 raise ValueError(f"parameter_values.{field} must contain non-negative values.")
+
+        path_limit = self.data["network"]["recourse_path_limit"]
+        if (
+            not isinstance(path_limit, int)
+            or isinstance(path_limit, bool)
+            or path_limit <= 0
+        ):
+            raise ValueError("network.recourse_path_limit must be a positive integer.")
 
     def combinations(self) -> list[dict[str, float | None]]:
         """Return the Cartesian product of configured parameter values."""
@@ -141,6 +160,38 @@ class SensitivityConfig:
             dict(zip(COST_FIELDS, combination, strict=True))
             for combination in itertools.product(*value_lists)
         ]
+
+    def with_recourse_path_limit(self, path_limit: int) -> SensitivityConfig:
+        """Return an independently configurable copy with one route limit."""
+        copied_data = _merge_defaults({}, self.data)
+        copied_data["network"]["recourse_path_limit"] = path_limit
+
+        copied_config = object.__new__(SensitivityConfig)
+        copied_config.path = self.path
+        copied_config.data = copied_data
+        copied_config._validate()
+        return copied_config
+
+
+def _write_json_atomic(path: Path, payload: Any) -> None:
+    """Write JSON without exposing a partially written result file."""
+    temporary_path = path.with_suffix(path.suffix + ".tmp")
+    temporary_path.write_text(json.dumps(payload, indent=2, allow_nan=False))
+    temporary_path.replace(path)
+
+
+class _StoreOutputDirectory(argparse.Action):
+    """Store a CLI output path and record that the user explicitly chose it."""
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: Path,
+        option_string: str | None = None,
+    ) -> None:
+        setattr(namespace, self.dest, values)
+        setattr(namespace, "output_dir_explicit", True)
 
 
 class ProblemPreparer:
@@ -185,13 +236,29 @@ class ProblemPreparer:
         if not shipments:
             raise ValueError("No valid overlapping shipments were found.")
 
-        scenarios = self._build_scenarios(legs, t100_processor)
+        feasible_routes_by_shipment = build_feasible_routes_by_shipment(
+            shipments,
+            legs,
+            max_paths=int(self.config["network"]["recourse_path_limit"]),
+        )
+        feasible_air_routes = {
+            route
+            for routes in feasible_routes_by_shipment.values()
+            for route in routes
+            if route[2] == "air"
+        }
+        scenarios = self._build_scenarios(
+            legs,
+            t100_processor,
+            feasible_air_routes,
+        )
         return PreparedProblem(
             shipments=shipments,
             legs=legs,
             scenarios=scenarios,
             seed=int(self.config["seed"]),
             num_scenarios=int(self.config["num_scenarios"]),
+            feasible_routes_by_shipment=feasible_routes_by_shipment,
         )
 
     @staticmethod
@@ -424,8 +491,9 @@ class ProblemPreparer:
         self,
         legs: dict[tuple[str, str, str], LegOption],
         t100_processor: T100DataProcessing,
+        feasible_air_routes: set[tuple[str, str, str]],
     ) -> dict[tuple[str, str, str], UncertaintyRealization]:
-        """Create one common random-number scenario set for every cost point."""
+        """Create shared scenarios only for air routes used by sparse recourse."""
         npz = np.load(Path(__file__).parent / "psi_bar.npz")
         psi_bar = npz["psi_bar"]
         n_design = int(npz["n_design"])
@@ -434,7 +502,7 @@ class ProblemPreparer:
 
         scenarios: dict[tuple[str, str, str], UncertaintyRealization] = {}
         for route, leg in legs.items():
-            if route[2] != "air":
+            if route not in feasible_air_routes:
                 continue
 
             slack = t100_processor._truncated_slack_samples(
@@ -458,28 +526,141 @@ class ProblemPreparer:
 
 
 class SensitivityRunner:
-    """Solve one parameter combination and serialize its compact JSON result."""
+    """Solve sensitivity combinations over one fixed constraint matrix.
+
+    The prepared problem fixes the network, shipments, and scenario realizations.
+    Cost sensitivity therefore changes only the linear objective coefficients, so a
+    worker can build the (potentially large) model once and re-use it for several
+    combinations.
+    """
 
     def __init__(self, config: SensitivityConfig, prepared: PreparedProblem) -> None:
         self.config = config
         self.prepared = prepared
 
     def run(self, run_index: int, output_dir: Path) -> Path:
-        combinations = self.config.combinations()
-        if not 0 <= run_index < len(combinations):
-            raise IndexError(f"run index must be in 0..{len(combinations) - 1}")
+        """Run one combination (kept for backwards-compatible array jobs)."""
+        return self.run_many((run_index,), output_dir)[0]
 
-        parameter_values = dict(self.config.data["base_parameters"]) | combinations[run_index]
+    def run_many(self, run_indices: Sequence[int], output_dir: Path) -> list[Path]:
+        """Run combinations sequentially while reusing one Gurobi model.
+
+        Only the objective coefficients vary across the configured combinations.
+        The variable and constraint matrix are consequently constructed exactly
+        once for this method call.
+        """
+        combinations = self.config.combinations()
+        indices = tuple(run_indices)
+        if not indices:
+            return []
+        for run_index in indices:
+            if not 0 <= run_index < len(combinations):
+                raise IndexError(f"run index must be in 0..{len(combinations) - 1}")
+
+        model, solver, first_stage, keep, reassign = self._build_model()
+
+        output_dir.mkdir(parents=True, exist_ok=True)
+        result_paths: list[Path] = []
+        for run_index in indices:
+            parameter_values = (
+                dict(self.config.data["base_parameters"]) | combinations[run_index]
+            )
+            self._set_cost_objective(
+                model,
+                solver,
+                first_stage,
+                keep,
+                reassign,
+                StochasticOptimizationParameters(**parameter_values),
+            )
+            model.optimize()
+            self._validate_first_stage_routes(
+                run_index,
+                model,
+                solver,
+                first_stage,
+            )
+
+            result = self._build_result(
+                run_index,
+                parameter_values,
+                model,
+                solver,
+                first_stage,
+                keep,
+                reassign,
+            )
+            result_path = output_dir / f"run_{run_index:06d}.json"
+            _write_json_atomic(result_path, result)
+            result_paths.append(result_path)
+
+        return result_paths
+
+    def solve_once(
+        self,
+        parameters: dict[str, float | None],
+        *,
+        run_label: str,
+    ) -> dict[str, Any]:
+        """Build and solve one prepared problem for explicitly supplied costs.
+
+        This intentionally does not use ``parameter_values``. It supports modes
+        whose inputs change the constraint matrix, such as route-limit
+        sensitivity, where reusing a model across cases is not valid.
+        """
+        model, solver, first_stage, keep, reassign = self._build_model()
+        self._set_cost_objective(
+            model,
+            solver,
+            first_stage,
+            keep,
+            reassign,
+            StochasticOptimizationParameters(**parameters),
+        )
+        model.optimize()
+        # breakpoint()
+        self._validate_first_stage_routes(run_label, model, solver, first_stage)
+        return self._build_result(
+            None,
+            parameters,
+            model,
+            solver,
+            first_stage,
+            keep,
+            reassign,
+        )
+
+    def _build_model(self) -> tuple[Any, TwoStageSolver, Any, Any, Any]:
+        """Create the fixed model and decision variables for one prepared input."""
         solver_options = self.config.data["solver"]
+        feasible_routes = getattr(
+            self.prepared,
+            "feasible_routes_by_shipment",
+            None,
+        )
+        if feasible_routes is None:
+            print(
+                "Prepared problem has no stored recourse route sets; computing them "
+                "now. Re-run --prepare to also prune stored scenario realizations."
+            )
         solver = TwoStageSolver(
             shipments=self.prepared.shipments,
             legs=self.prepared.legs,
-            params=StochasticOptimizationParameters(**parameter_values),
+            # Cost parameters do not appear in the constraints. The base values
+            # are only used while the fixed model is built; each solve updates the
+            # objective below.
+            params=StochasticOptimizationParameters(
+                **self.config.data["base_parameters"]
+            ),
             solver_quiet=bool(solver_options["quiet"]),
+            feasible_routes_by_shipment=feasible_routes,
+            recourse_path_limit=int(
+                self.config.data["network"]["recourse_path_limit"]
+            ),
         )
 
         model, first_stage, first_stage_cost = solver.stage_one_setup(
-            gp.Model(f"sensitivity_{run_index}")
+            gp.Model("sensitivity")
         )
         model, keep, reassign, recourse_cost = solver.stage_two_setup(
             model,
@@ -488,27 +669,182 @@ class SensitivityRunner:
             self.prepared.scenarios,
         )
         self._configure_gurobi(model, solver_options)
-        model.setObjective(
-            first_stage_cost + recourse_cost / self.prepared.num_scenarios,
-            gp.GRB.MINIMIZE,
-        )
-        model.optimize()
 
-        result = self._build_result(
-            run_index,
-            parameter_values,
+        # The setup methods return expressions for their standalone callers, but
+        # this runner updates objective coefficients in place instead. Explicitly
+        # clear the objective before applying the first parameter combination.
+        del first_stage_cost, recourse_cost
+        model.setObjective(0.0, gp.GRB.MINIMIZE)
+        return model, solver, first_stage, keep, reassign
+
+    @staticmethod
+    def _validate_first_stage_routes(
+        run_index: int | str,
+        model: gp.Model,
+        solver: TwoStageSolver,
+        first_stage: Any,
+    ) -> None:
+        """Fail fast when the unrestricted first stage leaves sparse recourse."""
+        if model.SolCount == 0:
+            return
+
+        violations: list[
+            tuple[str, tuple[RouteKey, ...], tuple[RouteKey, ...]]
+        ] = []
+        for shipment_id in solver.S:
+            feasible_routes = solver.feasible_route_sets[shipment_id]
+            selected_routes = tuple(
+                route
+                for route in solver.R
+                if first_stage[shipment_id, *route].X > 0.5
+            )
+            routes_outside_recourse_set = tuple(
+                route for route in selected_routes if route not in feasible_routes
+            )
+            if routes_outside_recourse_set:
+                violations.append(
+                    (shipment_id, selected_routes, routes_outside_recourse_set)
+                )
+
+        if violations:
+            details = "\n".join(
+                "\n".join(
+                    (
+                        f"  shipment={shipment_id!r}",
+                        "    intended_origin="
+                        f"{solver.shipments[shipment_id].origin.node_id!r}",
+                        "    intended_destination="
+                        f"{solver.shipments[shipment_id].destination.node_id!r}",
+                        f"    selected_first_stage_routes={selected_routes!r}",
+                        "    routes_outside_recourse_set="
+                        f"{routes_outside_recourse_set!r}",
+                    )
+                )
+                for shipment_id, selected_routes, routes_outside_recourse_set in violations
+            )
+            raise RuntimeError(
+                f"Sensitivity run {run_index} selected first-stage routes outside "
+                f"the shipment-specific recourse sets:\n{details}"
+            )
+
+    @staticmethod
+    def _set_first_stage_cost_objective(
+        model: gp.Model,
+        solver: TwoStageSolver,
+        first_stage: Any,
+        params: StochasticOptimizationParameters,
+        *,
+        include_shipment_weight: bool = True,
+    ) -> None:
+        """Set first-stage objective coefficients for one cost combination.
+
+        ``include_shipment_weight=False`` is a diagnostic option that leaves
+        shipment weight out of first-stage leg costs.
+        """
+        first_stage_variables = []
+        first_stage_coefficients = []
+        for shipment_id in solver.S:
+            shipment = solver.shipments[shipment_id]
+            shipment_cost_multiplier = shipment.weight if include_shipment_weight else 1.0
+            for route in solver.R:
+                unit_cost = (
+                    params.cost_flight
+                    if route[2] == "air"
+                    else params.cost_ground
+                )
+                first_stage_variables.append(first_stage[shipment_id, *route])
+                first_stage_coefficients.append(
+                    unit_cost
+                    * shipment_cost_multiplier
+                    * solver.legs[route].distance_miles
+                )
+        model.setAttr(
+            gp.GRB.Attr.Obj,
+            first_stage_variables,
+            first_stage_coefficients,
+        )
+
+    def _set_cost_objective(
+        self,
+        model: gp.Model,
+        solver: TwoStageSolver,
+        first_stage: Any,
+        keep: Any,
+        reassign: Any,
+        params: StochasticOptimizationParameters,
+        *,
+        include_shipment_weight: bool = True,
+    ) -> None:
+        """Replace objective coefficients for one two-stage cost combination."""
+        self._set_first_stage_cost_objective(
             model,
             solver,
             first_stage,
-            keep,
-            reassign,
+            params,
+            include_shipment_weight=include_shipment_weight,
         )
-        output_dir.mkdir(parents=True, exist_ok=True)
-        result_path = output_dir / f"run_{run_index:06d}.json"
-        temporary_path = result_path.with_suffix(".json.tmp")
-        temporary_path.write_text(json.dumps(result, indent=2, allow_nan=False))
-        temporary_path.replace(result_path)
-        return result_path
+
+        scenario_probability = 1.0 / self.prepared.num_scenarios
+
+        # Subtracting the expected unused-assignment credit makes the net
+        # coefficient of each recourse-eligible first-stage variable zero:
+        # C(x) - E[C(x)] = 0. Routes outside the sparse recourse set retain
+        # their ordinary first-stage coefficients.
+        credited_first_stage_variables = [
+            first_stage[shipment_id, *route]
+            for shipment_id in solver.S
+            for route in solver.feasible_by_shipment[shipment_id]
+        ]
+        model.setAttr(
+            gp.GRB.Attr.Obj,
+            credited_first_stage_variables,
+            [0.0] * len(credited_first_stage_variables),
+        )
+
+        kept_coefficients = []
+        reassignment_coefficients = []
+        for shipment_id in solver.S:
+            shipment = solver.shipments[shipment_id]
+            shipment_cost_multiplier = (
+                shipment.weight if include_shipment_weight else 1.0
+            )
+            for route in solver.feasible_by_shipment[shipment_id]:
+                original_unit_cost = (
+                    params.cost_flight
+                    if route[2] == "air"
+                    else params.cost_ground
+                )
+                distance = solver.legs[route].distance_miles
+                original_leg_cost = (
+                    original_unit_cost * shipment_cost_multiplier * distance
+                )
+                kept_coefficients.append(original_leg_cost * scenario_probability)
+                reassignment_coefficients.append(
+                    (original_leg_cost + params.cost_penalty_incompatibility)
+                    * scenario_probability
+                )
+
+        # Updating a scenario at a time avoids retaining a second S x R x Omega
+        # Python list of Gurobi variable objects solely for coefficient updates.
+        scenario_coefficients = kept_coefficients + reassignment_coefficients
+        for scenario_index in range(self.prepared.num_scenarios):
+            kept_variables = [
+                keep[shipment_id, *route, scenario_index]
+                for shipment_id in solver.S
+                for route in solver.feasible_by_shipment[shipment_id]
+            ]
+            reassignment_variables = [
+                reassign[shipment_id, *route, scenario_index]
+                for shipment_id in solver.S
+                for route in solver.feasible_by_shipment[shipment_id]
+            ]
+            model.setAttr(
+                gp.GRB.Attr.Obj,
+                kept_variables + reassignment_variables,
+                scenario_coefficients,
+            )
+
+        model.ModelSense = gp.GRB.MINIMIZE
 
     @staticmethod
     def _configure_gurobi(model: gp.Model, options: dict[str, Any]) -> None:
@@ -522,7 +858,7 @@ class SensitivityRunner:
 
     def _build_result(
         self,
-        run_index: int,
+        run_index: int | None,
         parameters: dict[str, float | None],
         model: gp.Model,
         solver: TwoStageSolver,
@@ -553,8 +889,7 @@ class SensitivityRunner:
                     reassign,
                 )
 
-        return {
-            "run_index": run_index,
+        result: dict[str, Any] = {
             "parameters": parameters,
             "seed": self.prepared.seed,
             "num_scenarios": self.prepared.num_scenarios,
@@ -563,6 +898,9 @@ class SensitivityRunner:
             "runtime_seconds": float(model.Runtime),
             "decision_variables_by_shipment": decisions,
         }
+        if run_index is not None:
+            result = {"run_index": run_index} | result
+        return result
 
     @staticmethod
     def _add_first_stage_decisions(
@@ -593,7 +931,7 @@ class SensitivityRunner:
     ) -> None:
         for scenario_index in range(self.prepared.num_scenarios):
             scenario_decisions = []
-            for route in solver.R:
+            for route in solver.feasible_by_shipment[shipment_id]:
                 keep_value = keep[shipment_id, *route, scenario_index].X
                 reassign_value = reassign[shipment_id, *route, scenario_index].X
                 if keep_value > 1e-6 or reassign_value > 1e-6:
@@ -610,8 +948,61 @@ class SensitivityRunner:
                 shipment_result["recourse"][str(scenario_index)] = scenario_decisions
 
 
+class RouteLimitSensitivityRunner:
+    """Independently solve a fixed set of feasible-route preprocessing limits."""
+
+    def __init__(self, config: SensitivityConfig) -> None:
+        self.config = config
+
+    def run(self, output_dir: Path) -> list[Path]:
+        """Prepare, solve, and summarize every configured route-path limit.
+
+        Each iteration constructs a new ``ProblemPreparer`` with the original
+        configured seed. That makes each case independent while keeping scenario
+        draws comparable for routes shared by multiple K values.
+        """
+        output_dir.mkdir(parents=True, exist_ok=True)
+        baseline_parameters = dict(self.config.data["base_parameters"])
+        results: list[dict[str, Any]] = []
+        result_paths: list[Path] = []
+
+        for path_limit in ROUTE_PATH_LIMITS:
+            case_config = self.config.with_recourse_path_limit(path_limit)
+            prepared = ProblemPreparer(case_config).prepare()
+            result = SensitivityRunner(case_config, prepared).solve_once(
+                baseline_parameters,
+                run_label=f"K sensitivity (K={path_limit})",
+            )
+            result["recourse_path_limit"] = path_limit
+
+            result_path = output_dir / f"k_{path_limit:03d}.json"
+            _write_json_atomic(result_path, result)
+            results.append(result)
+            result_paths.append(result_path)
+
+        summary = {
+            "analysis": "recourse_path_limit_sensitivity",
+            "base_parameters": baseline_parameters,
+            "route_path_limits": list(ROUTE_PATH_LIMITS),
+            "results": [
+                {
+                    "recourse_path_limit": result["recourse_path_limit"],
+                    "status": result["status"],
+                    "objective_value": result["objective_value"],
+                    "runtime_seconds": result["runtime_seconds"],
+                }
+                for result in results
+            ],
+        }
+        summary_path = output_dir / "summary.json"
+        _write_json_atomic(summary_path, summary)
+        result_paths.append(summary_path)
+        return result_paths
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.set_defaults(output_dir_explicit=False)
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument(
         "--prepared-problem",
@@ -626,13 +1017,33 @@ def _build_parser() -> argparse.ArgumentParser:
         "--output-dir",
         type=Path,
         default=Path("output/sensitivity/results"),
+        action=_StoreOutputDirectory,
+        help=(
+            "Result directory. Defaults to output/sensitivity/results for cost "
+            "commands and output/k_sensitivity for --k-sensitivity."
+        ),
     )
 
     command = parser.add_mutually_exclusive_group(required=True)
     command.add_argument("--prepare", action="store_true")
     command.add_argument("--run-index", type=int)
+    command.add_argument(
+        "--run-index-range",
+        nargs=2,
+        type=int,
+        metavar=("START", "STOP"),
+        help="Run indices in the half-open interval [START, STOP) using one model.",
+    )
     command.add_argument("--print-run-count", action="store_true")
     command.add_argument("--merge", action="store_true")
+    command.add_argument(
+        "--k-sensitivity",
+        action="store_true",
+        help=(
+            f"Independently prepare and solve K={', '.join(map(str, ROUTE_PATH_LIMITS))} using only "
+            "base_parameters."
+        ),
+    )
     return parser
 
 
@@ -640,8 +1051,16 @@ def main(argv: list[str] | None = None) -> None:
     args = _build_parser().parse_args(sys.argv[1:] if argv is None else argv)
     args.config = _relative_to_script(args.config)
     args.prepared_problem = _relative_to_script(args.prepared_problem)
+    if args.k_sensitivity and not args.output_dir_explicit:
+        args.output_dir = Path("output/k_sensitivity")
     args.output_dir = _relative_to_script(args.output_dir)
     config = SensitivityConfig(args.config)
+
+    if args.k_sensitivity:
+        result_paths = RouteLimitSensitivityRunner(config).run(args.output_dir)
+        for result_path in result_paths:
+            print(result_path)
+        return
 
     if args.print_run_count:
         print(len(config.combinations()))
@@ -676,11 +1095,25 @@ def main(argv: list[str] | None = None) -> None:
     with args.prepared_problem.open("rb") as input_file:
         prepared = pickle.load(input_file)
 
+    runner = SensitivityRunner(config, prepared)
+    if args.run_index_range is not None:
+        start, stop = args.run_index_range
+        if stop < start:
+            raise ValueError("--run-index-range requires STOP >= START")
+        run_count = len(config.combinations())
+        if start < 0 or start >= run_count:
+            raise IndexError(f"range start must be in 0..{run_count - 1}")
+        # The final Slurm chunk is commonly shorter than CHUNK_SIZE.
+        result_paths = runner.run_many(range(start, min(stop, run_count)), args.output_dir)
+        for result_path in result_paths:
+            print(result_path)
+        return
+
     run_index = args.run_index
     if run_index is None:
         run_index = int(os.environ["SLURM_ARRAY_TASK_ID"])
 
-    result_path = SensitivityRunner(config, prepared).run(run_index, args.output_dir)
+    result_path = runner.run(run_index, args.output_dir)
     print(result_path)
 
 
