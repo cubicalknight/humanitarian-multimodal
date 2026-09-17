@@ -20,7 +20,7 @@ import os
 import random
 import signal
 import tracemalloc
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from heapq import heappop, heappush
 from itertools import count
@@ -137,6 +137,7 @@ def _shortest_route_path(
     destination: str,
     outgoing: dict[str, tuple[RouteKey, ...]],
     legs: dict[RouteKey, LegOption],
+    route_costs: dict[RouteKey, float],
     banned_nodes: frozenset[str] = frozenset(),
     banned_routes: frozenset[RouteKey] = frozenset(),
 ) -> RoutePath | None:
@@ -167,7 +168,7 @@ def _shortest_route_path(
                 or next_node in path_nodes
             ):
                 continue
-            next_distance = distance + legs[route].distance_miles
+            next_distance = distance + route_costs[route]
             if next_distance >= best_distance.get(next_node, math.inf):
                 continue
             best_distance[next_node] = next_distance
@@ -190,26 +191,35 @@ def k_shortest_route_paths(
     origin: str,
     destination: str,
     max_paths: int = 10,
+    route_cost: Callable[[RouteKey, LegOption], float] | None = None,
 ) -> tuple[RoutePath, ...]:
     """Return up to ``max_paths`` shortest loopless directed edge paths.
 
     This is Yen's algorithm over route keys rather than node pairs, so parallel
     air and ground legs between the same nodes remain distinct alternatives.
+    By default paths are ranked by actual leg distance; callers may supply a
+    non-negative finite edge-cost function for another deterministic ranking.
     """
     if max_paths <= 0:
         raise ValueError("max_paths must be positive")
 
+    cost_function = route_cost or (lambda _route, leg: leg.distance_miles)
+    route_costs: dict[RouteKey, float] = {}
     outgoing_lists: dict[str, list[RouteKey]] = {}
     for route, leg in legs.items():
-        if not math.isfinite(leg.distance_miles) or leg.distance_miles < 0:
-            raise ValueError(f"Route {route!r} has an invalid distance")
+        cost = float(cost_function(route, leg))
+        if not math.isfinite(cost) or cost < 0:
+            raise ValueError(f"Route {route!r} has an invalid path cost")
+        route_costs[route] = cost
         outgoing_lists.setdefault(route[0], []).append(route)
     outgoing = {
         node: tuple(sorted(routes, key=lambda route: (route[1], route[2], route[0])))
         for node, routes in outgoing_lists.items()
     }
 
-    first_path = _shortest_route_path(origin, destination, outgoing, legs)
+    first_path = _shortest_route_path(
+        origin, destination, outgoing, legs, route_costs
+    )
     if first_path is None:
         return ()
 
@@ -236,6 +246,7 @@ def k_shortest_route_paths(
                 destination,
                 outgoing,
                 legs,
+                route_costs,
                 banned_nodes=removed_nodes,
                 banned_routes=removed_routes,
             )
@@ -245,7 +256,7 @@ def k_shortest_route_paths(
             candidate = root_path + spur_path
             if candidate in accepted_set or candidate in candidate_set:
                 continue
-            candidate_cost = sum(legs[route].distance_miles for route in candidate)
+            candidate_cost = sum(route_costs[route] for route in candidate)
             heappush(candidates, (candidate_cost, candidate))
             candidate_set.add(candidate)
 
@@ -288,6 +299,91 @@ def build_feasible_routes_by_shipment(
                     seen.add(route)
                     ordered_routes.append(route)
         feasible[shipment_id] = tuple(ordered_routes)
+
+    return feasible
+
+
+def build_seed_union_feasible_routes_by_shipment(
+    shipments: dict[str, Shipment],
+    legs: dict[RouteKey, LegOption],
+    cost_seed_pairs: Sequence[tuple[float, float]],
+    max_paths: int = 10,
+) -> dict[str, tuple[RouteKey, ...]]:
+    """Return the legs in each shipment's unique seed-path union."""
+    return {
+        shipment_id: tuple(dict.fromkeys(route for path in paths for route in path))
+        for shipment_id, paths in build_seed_union_paths_by_shipment(
+            shipments, legs, cost_seed_pairs, max_paths
+        ).items()
+    }
+
+
+def build_seed_union_paths_by_shipment(
+    shipments: dict[str, Shipment],
+    legs: dict[RouteKey, LegOption],
+    cost_seed_pairs: Sequence[tuple[float, float]],
+    max_paths: int = 10,
+) -> dict[str, tuple[RoutePath, ...]]:
+    """Build pooled routes from cost-seeded and raw-distance Yen path sets.
+
+    Each cost seed is an ``(air_cost, ground_cost)`` pair.  Its edge cost is
+    ``shipment.weight * leg.distance_miles * mode_unit_cost``.  The final raw
+    distance branch ensures the legacy K-distance paths are also represented.
+    """
+    if max_paths <= 0:
+        raise ValueError("max_paths must be positive")
+
+    unique_seed_pairs = tuple(dict.fromkeys(cost_seed_pairs))
+    for air_cost, ground_cost in unique_seed_pairs:
+        if not all(
+            math.isfinite(float(value)) and float(value) >= 0
+            for value in (air_cost, ground_cost)
+        ):
+            raise ValueError("cost seed pairs must contain finite non-negative costs")
+
+    feasible: dict[str, tuple[RoutePath, ...]] = {}
+    for shipment_id, shipment in shipments.items():
+        origin = shipment.origin.node_id
+        destination = shipment.destination.node_id
+        paths: list[RoutePath] = []
+
+        for air_cost, ground_cost in unique_seed_pairs:
+            def seeded_cost(
+                route: RouteKey,
+                leg: LegOption,
+                *,
+                air_cost: float = float(air_cost),
+                ground_cost: float = float(ground_cost),
+            ) -> float:
+                if route[2] == "air":
+                    unit_cost = air_cost
+                elif route[2] == "ground":
+                    unit_cost = ground_cost
+                else:
+                    raise ValueError(f"Route {route!r} has unsupported mode for cost seed")
+                return shipment.weight * leg.distance_miles * unit_cost
+
+            paths.extend(
+                k_shortest_route_paths(
+                    legs,
+                    origin,
+                    destination,
+                    max_paths=max_paths,
+                    route_cost=seeded_cost,
+                )
+            )
+
+        paths.extend(
+            k_shortest_route_paths(legs, origin, destination, max_paths=max_paths)
+        )
+        unique_paths = tuple(dict.fromkeys(paths))
+        if not unique_paths or not any(unique_paths):
+            raise ValueError(
+                f"No directed route path for shipment {shipment_id!r} from "
+                f"{origin!r} to {destination!r}"
+            )
+
+        feasible[shipment_id] = unique_paths
 
     return feasible
 
@@ -360,10 +456,12 @@ class TwoStageSolver:
         solver_quiet: bool = False,
         feasible_routes_by_shipment: dict[str, Sequence[RouteKey]] | None = None,
         recourse_path_limit: int = 20,
+        restrict_first_stage: bool = True,
     ):
         self.shipments = shipments
         self.legs = legs
         self.params = params
+        self.restrict_first_stage = restrict_first_stage
 
         # Materialize these once.  They are traversed many times while the model is
         # built, so repeatedly filtering ``self.R`` in the inner loops is costly.
@@ -471,9 +569,38 @@ class TwoStageSolver:
             origin = self.shipments[shipment].origin.node_id
             destination = self.shipments[shipment].destination.node_id
 
+            if self.restrict_first_stage:
+                # ``x`` remains dense to preserve the public variable indexing,
+                # but only this shipment's candidate-path union may be selected.
+                model.addConstrs(
+                    (
+                        x[shipment, *route] == 0
+                        for route in self.R
+                        if route not in self.feasible_route_sets[shipment]
+                    ),
+                    name=f"first_stage_ineligible_{shipment}",
+                )
+
+            outgoing = (
+                self.feasible_outgoing[shipment]
+                if self.restrict_first_stage
+                else self.outgoing
+            )
+            incoming = (
+                self.feasible_incoming[shipment]
+                if self.restrict_first_stage
+                else self.incoming
+            )
+
             for l in self.nodes:
-                flow_out = gp.quicksum(x[shipment, *route] for route in self.outgoing[l])
-                flow_in = gp.quicksum(x[shipment, *route] for route in self.incoming[l])
+                flow_out = gp.quicksum(
+                    x[shipment, *route]
+                    for route in outgoing.get(l, ())
+                )
+                flow_in = gp.quicksum(
+                    x[shipment, *route]
+                    for route in incoming.get(l, ())
+                )
 
                 if l == origin:
                     rhs = 1
@@ -484,8 +611,42 @@ class TwoStageSolver:
 
                 model.addConstr(flow_out - flow_in == rhs, name=f"flow_conservation_{shipment}_{l}")
 
-            model.addConstrs(x[shipment, o, i, 'ground'] == gp.quicksum(x[shipment, k, j, 'air'] for (k, j, _) in self.air_legs if k == i) for (o, i, _) in self.gnd_legs if o == origin)
-            model.addConstrs(x[shipment, j, d, 'ground'] == gp.quicksum(x[shipment, i, k, 'air'] for (i, k, _) in self.air_legs if k == j) for (j, d, _) in self.gnd_legs if d == destination)
+            if self.restrict_first_stage:
+                model.addConstrs(
+                    x[shipment, *route] == gp.quicksum(
+                        x[shipment, *air_route]
+                        for air_route in self.feasible_air_outgoing[shipment].get(route[1], ())
+                    )
+                    for route in self.feasible_ground[shipment]
+                    if route[0] == origin
+                )
+                model.addConstrs(
+                    x[shipment, *route] == gp.quicksum(
+                        x[shipment, *air_route]
+                        for air_route in self.feasible_air_incoming[shipment].get(route[0], ())
+                    )
+                    for route in self.feasible_ground[shipment]
+                    if route[1] == destination
+                )
+            else:
+                model.addConstrs(
+                    x[shipment, o, i, "ground"] == gp.quicksum(
+                        x[shipment, k, j, "air"]
+                        for (k, j, _) in self.air_legs
+                        if k == i
+                    )
+                    for (o, i, _) in self.gnd_legs
+                    if o == origin
+                )
+                model.addConstrs(
+                    x[shipment, j, d, "ground"] == gp.quicksum(
+                        x[shipment, i, k, "air"]
+                        for (i, k, _) in self.air_legs
+                        if k == j
+                    )
+                    for (j, d, _) in self.gnd_legs
+                    if d == destination
+                )
 
         cost = gp.quicksum(
             self.params.cost_flight * x[s, i, j, m] * self.shipments[s].weight * self.legs[(i, j, m)].distance_miles 

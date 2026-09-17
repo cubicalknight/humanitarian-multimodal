@@ -1,9 +1,10 @@
 """Plot feasible-route-limit (K) sensitivity results.
 
-The script expects the detailed ``k_*.json`` files written by
-``main.py --k-sensitivity``.  It plots the objective and the final
-(post-recourse) ground and air links per shipment.  The modal panel shows the
+The script reads matched cost/weight and distance-only results, falling back to
+``k_*.json`` files when no matched results exist. It plots the objective and final
+(post-recourse) ground and air links per shipment. The link figures show the
 mean over all shipment--scenario final routings, with min--max bands.
+Each objective and metric is saved as a separate figure.
 
 Example::
 
@@ -22,6 +23,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.ticker import MaxNLocator
 import pandas as pd
 import seaborn as sns
 
@@ -42,11 +44,20 @@ def jaccard(left: set[LegKey], right: set[LegKey]) -> float:
 def load_results(input_dir: Path) -> list[dict[str, Any]]:
     """Load and validate detailed K result files in ascending K order."""
     results: list[dict[str, Any]] = []
-    for path in sorted(input_dir.glob("k_*.json")):
+    matched = sorted(input_dir.glob("cost_weighted_k_*.json")) + sorted(
+        input_dir.glob("distance_only_matched_k_*.json")
+    )
+    for path in matched or sorted(input_dir.glob("k_*.json")):
         with path.open(encoding="utf-8") as stream:
             result = json.load(stream)
-        if "recourse_path_limit" not in result:
+        k = result.get("cost_weighted_path_limit") or result.get("recourse_path_limit")
+        if k is None:
             raise ValueError(f"{path} has no 'recourse_path_limit'.")
+        result["recourse_path_limit"] = int(k)
+        result["case"] = (
+            "Distance only" if result.get("feasible_path_mode") == "distance_only"
+            else "Cost/weight"
+        )
         if "decision_variables_by_shipment" not in result:
             raise ValueError(f"{path} has no shipment decisions.")
         results.append(result)
@@ -54,7 +65,7 @@ def load_results(input_dir: Path) -> list[dict[str, Any]]:
     if not results:
         raise FileNotFoundError(f"No k_*.json result files found in {input_dir}.")
 
-    limits = [int(result["recourse_path_limit"]) for result in results]
+    limits = [(result["case"], int(result["recourse_path_limit"])) for result in results]
     if len(limits) != len(set(limits)):
         raise ValueError(f"Duplicate K values found: {limits}")
     return sorted(results, key=lambda result: int(result["recourse_path_limit"]))
@@ -67,18 +78,39 @@ def build_tables(
     active_threshold: float = 1e-6,
 ) -> dict[str, pd.DataFrame]:
     """Extract the objective, final links, and first-stage Jaccard values."""
+
     result_list = list(results)
+
     if not result_list:
         raise ValueError("At least one K result is required.")
+    
+    if any("case" in result for result in result_list):
+        grouped = []
+        for case in dict.fromkeys(result["case"] for result in result_list):
+            case_results = [
+                {key: value for key, value in result.items() if key != "case"}
+                for result in result_list if result["case"] == case
+            ]
+            grouped.append({
+                key: table.assign(case=case)
+                for key, table in build_tables(
+                    case_results, reference_k=reference_k,
+                    active_threshold=active_threshold,
+                ).items()
+            })
+        return {key: pd.concat([group[key] for group in grouped], ignore_index=True)
+                for key in grouped[0]}
 
     limits = sorted(int(result["recourse_path_limit"]) for result in result_list)
     reference_k = max(limits) if reference_k is None else reference_k
+    
     if reference_k not in limits:
         raise ValueError(f"Reference K={reference_k} is not among {limits}.")
 
     run_rows: list[dict[str, float | int]] = []
     recourse_rows: list[dict[str, Any]] = []
     first_routes: dict[tuple[int, str], set[LegKey]] = {}
+    final_routes: dict[tuple[int, str, int], set[LegKey]] = {}
 
     for result in result_list:
         k = int(result["recourse_path_limit"])
@@ -121,6 +153,7 @@ def build_tables(
                     + float(leg.get("reassign", 0.0))
                     > active_threshold
                 }
+                final_routes[k, shipment_id, int(scenario)] = active_routes
                 recourse_rows.append(
                     {
                         "K": k,
@@ -168,9 +201,22 @@ def build_tables(
             ["K", "shipment_id", "scenario"]
         ).reset_index(drop=True)
 
+    final_similarity = pd.DataFrame([
+        {
+            "K": k, "shipment_id": shipment_id, "scenario": scenario,
+            "reference_K": reference_k,
+            "jaccard_to_reference": jaccard(
+                routes, final_routes[reference_k, shipment_id, scenario]
+            ),
+        }
+        for (k, shipment_id, scenario), routes in sorted(final_routes.items())
+        if (reference_k, shipment_id, scenario) in final_routes
+    ])
+
     return {
         "runs": runs,
         "first_stage_similarity": first_similarity,
+        "final_route_similarity": final_similarity,
         "recourse_scenarios": recourse,
     }
 
@@ -181,95 +227,74 @@ def _save_figure(figure: plt.Figure, output_dir: Path, stem: str) -> None:
 
 
 def plot_tables(tables: Mapping[str, pd.DataFrame], output_dir: Path) -> None:
-    """Create PDF plots for K sensitivity and first-stage route similarity."""
+    """Write separate Seaborn figures, with consistent colors for each case."""
     output_dir.mkdir(parents=True, exist_ok=True)
     sns.set_theme(style="whitegrid", context="notebook")
-    colors = sns.color_palette("colorblind", n_colors=3)
-
+    palette = {"Cost/weight": "#1f77b4", "Distance only": "#d62728"}
+    tables = {
+        key: table if "case" in table else table.assign(case="Cost/weight")
+        for key, table in tables.items()
+    }
     runs = tables["runs"]
-    order = sorted(runs["K"].unique())
-    final_routings = tables["recourse_scenarios"]
+    xlabel = "Seed path limit K (distance counts matched per shipment)"
 
-    figure, axes = plt.subplots(1, 2, figsize=(11, 4.5), sharex=True)
+    figure = plt.figure(figsize=(6.5, 4.5))
+    axis = figure.add_subplot()
     sns.lineplot(
-        data=runs,
-        x="K",
-        y="objective_value",
-        color=colors[0],
-        marker="o",
-        ax=axes[0],
+        data=runs, x="K", y="objective_value", hue="case", palette=palette,
+        style="case", dashes={"Cost/weight": "", "Distance only": (4, 2)},
+        marker="o", errorbar=None, ax=axis,
     )
-    axes[0].set(title="Objective", xlabel="K", ylabel="Objective value")
+    missing_notes = []
+    for case, data in runs.groupby("case", sort=False):
+        missing = data.loc[data["objective_value"].isna(), "K"].tolist()
+        if missing:
+            missing_notes.append(f"{case}: no solution at K={', '.join(map(str, missing))}")
+    if missing_notes:
+        axis.text(0.02, 0.98, "\n".join(missing_notes),
+                  transform=axis.transAxes, va="top", fontsize=9)
+    axis.set(title="Objective", xlabel=xlabel, ylabel="Objective value")
+    axis.xaxis.set_major_locator(MaxNLocator(nbins=8, integer=True))
+    axis.legend(title="Case", frameon=False)
+    figure.tight_layout()
+    _save_figure(figure, output_dir, "objective")
 
-    ground_axis = axes[1]
-    air_axis = ground_axis.twinx()
-    for axis, column, label, color in (
-        (
-            ground_axis,
-            "n_ground_legs",
-            "Ground",
-            colors[1],
-        ),
-        (
-            air_axis,
-            "n_air_legs",
-            "Air",
-            colors[2],
-        ),
+    for table_key, column, title, ylabel, stem in (
+        ("recourse_scenarios", "n_ground_legs", "Final ground links per shipment",
+         "Average ground links", "ground_links"),
+        ("recourse_scenarios", "n_air_legs", "Final air links per shipment",
+         "Average air links", "air_links"),
+        ("first_stage_similarity", "jaccard_to_reference", "First-stage route similarity",
+         "Jaccard similarity to largest K in each case", "first_stage_jaccard"),
+        ("final_route_similarity", "jaccard_to_reference", "Final route similarity (keep + reassign)",
+         "Jaccard similarity to largest K in each case", "final_route_jaccard"),
     ):
-        sns.lineplot(
-            data=final_routings,
-            x="K",
-            y=column,
-            estimator="mean",
-            errorbar=("pi", 100),
-            err_style="band",
-            marker="o",
-            color=color,
-            label=label,
-            ax=axis,
+        data = tables[table_key]
+        if data.empty:
+            continue
+        figure = plt.figure(figsize=(6.5, 4.5))
+        axis = figure.add_subplot()
+        line_style = (
+            {"style": "case", "dashes": {"Cost/weight": "", "Distance only": (4, 2)}}
+            if table_key != "first_stage_similarity" else {}
         )
-        axis.set_ylim(-1, 3)
-    ground_axis.set(
-        title="Final links per shipment",
-        xlabel="K",
-        ylabel="Average ground links per shipment",
-    )
-    air_axis.set_ylabel("Average air links per shipment")
-    ground_axis.legend(loc="upper left", frameon=False)
-    air_axis.legend(loc="upper right", frameon=False)
-
-    for axis in axes:
-        axis.set_xticks(order)
-    figure.suptitle("K-sensitivity results", y=1.02)
-    figure.tight_layout()
-    _save_figure(figure, output_dir, "k_sensitivity")
-
-    similarity = tables["first_stage_similarity"]
-    if similarity.empty:
-        return
-
-    figure, axis = plt.subplots(figsize=(5.5, 4.5))
-    sns.lineplot(
-        data=similarity,
-        x="K",
-        y="jaccard_to_reference",
-        estimator="mean",
-        errorbar=("pi", 100),
-        err_style="band",
-        color=colors[0],
-        marker="o",
-        ax=axis,
-    )
-    axis.set(
-        title=f"First-stage similarity to K={similarity['reference_K'].iloc[0]}",
-        xlabel="K",
-        ylabel="Jaccard similarity",
-        ylim=(-0.03, 1.03),
-    )
-    axis.set_xticks(order)
-    figure.tight_layout()
-    _save_figure(figure, output_dir, "first_stage_jaccard")
+        sns.lineplot(
+            data=data, x="K", y=column, hue="case", palette=palette,
+            estimator="mean", errorbar=("pi", 100), err_style="band",
+            marker="o", ax=axis, **line_style,
+        )
+        if table_key in ("first_stage_similarity", "final_route_similarity"):
+            references = data.groupby("case")["reference_K"].first()
+            ylabel = "Jaccard similarity"
+            title += "\n" + "; ".join(f"{case}: reference K={k}" for case, k in references.items())
+            axis.set_ylim(-0.03, 1.03)
+        else:
+            axis.set_ylim(bottom=0)
+        axis.set(title=title, xlabel=xlabel, ylabel=ylabel)
+        axis.xaxis.set_major_locator(MaxNLocator(nbins=8, integer=True))
+        axis.legend(title="Case", frameon=False)
+        figure.tight_layout()
+        _save_figure(figure, output_dir, stem)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -277,13 +302,13 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--input-dir",
         type=Path,
-        default=Path("output/k_sensitivity"),
-        help="Directory containing detailed k_*.json files.",
+        default=Path(__file__).resolve().parent / "output/k_sensitivity",
+        help="Directory containing detailed matched results or legacy k_*.json files.",
     )
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("output/figures/k_sensitivity"),
+        default=Path(__file__).resolve().parent / "output/figures/k_sensitivity",
         help="Directory for PDF figures.",
     )
     parser.add_argument(
@@ -311,7 +336,7 @@ def main() -> None:
     )
     plot_tables(tables, args.output_dir)
     print(
-        f"Processed {len(results)} K values and wrote figures to "
+        f"Processed {len(results)} case/K results and wrote figures to "
         f"{args.output_dir.resolve()}"
     )
 

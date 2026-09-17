@@ -261,8 +261,8 @@ def plot_tables(tables: Mapping[str, pd.DataFrame], output_dir: Path) -> None:
     ground_costs = sorted(runs["cost_ground"].unique())
     air_costs = sorted(runs["cost_flight"].unique())
     penalties = sorted(runs["cost_penalty_incompatibility"].unique())
-    columns = min(3, len(penalties))
-    rows = math.ceil(len(penalties) / columns)
+    rows = min(3, len(penalties))
+    columns = math.ceil(len(penalties) / rows)
     for metric, (title, label) in METRICS.items():
         figure, axes = plt.subplots(
             rows, columns, figsize=(4.5 * columns + 1, 4 * rows), squeeze=False

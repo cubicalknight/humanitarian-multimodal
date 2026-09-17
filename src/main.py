@@ -9,8 +9,11 @@ Each array task reads the prepared problem, builds one Gurobi model, and writes
 only its own result files. This avoids repeated data preparation, repeated model
 construction within a task, and concurrent writes to shared results.
 
-Use ``--k-sensitivity`` to independently prepare and solve the fixed feasible-
-route limits 35, 70, 100, 150 with the configured baseline cost parameters.
+Use ``--k-sensitivity`` to independently prepare and solve every configured
+feasible-route limit with the baseline cost parameters.
+Use ``--matched-k-sensitivity`` to compare each configured seed-union
+path limit against a per-shipment, strictly distance-ranked path
+count.
 """
 
 from __future__ import annotations
@@ -42,6 +45,9 @@ from stoc_optimod import (
     TwoStageSolver,
     UncertaintyRealization,
     build_feasible_routes_by_shipment,
+    build_seed_union_feasible_routes_by_shipment,
+    build_seed_union_paths_by_shipment,
+    k_shortest_route_paths,
 )
 
 COST_FIELDS = (
@@ -50,8 +56,9 @@ COST_FIELDS = (
     "cost_penalty_incompatibility",
 )
 
-# Sweep set for --k-sensitivity. Minimum is 35
-ROUTE_PATH_LIMITS = (35, 70, 100, 150)
+# Sweep set for --k-sensitivity and --matched-k-sensitivity.
+ROUTE_PATH_LIMITS = (1, 2, 5, 10, 20)
+# ROUTE_PATH_LIMITS = (10,)
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "seed": 42,
@@ -78,6 +85,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "max_city_attempts": 10,
         "max_ground_distance_miles": 500.0,
         "recourse_path_limit": 10,
+        "feasible_path_mode": "distance_only",
+        "restrict_first_stage": True,
     },
 }
 
@@ -99,6 +108,10 @@ class PreparedProblem:
     seed: int
     num_scenarios: int
     feasible_routes_by_shipment: dict[str, tuple[RouteKey, ...]] | None = None
+    feasible_path_mode: str = "distance_only"
+    recourse_path_limit: int | None = None
+    recourse_path_limits_by_shipment: dict[str, int] | None = None
+    cost_seed_pairs: tuple[tuple[float, float], ...] = ()
 
 
 def _merge_defaults(given: dict[str, Any], defaults: dict[str, Any]) -> dict[str, Any]:
@@ -147,6 +160,15 @@ class SensitivityConfig:
         ):
             raise ValueError("network.recourse_path_limit must be a positive integer.")
 
+        path_mode = self.data["network"]["feasible_path_mode"]
+        if path_mode not in {"distance_only", "seed_union"}:
+            raise ValueError(
+                "network.feasible_path_mode must be 'distance_only' or 'seed_union'."
+            )
+
+        if not isinstance(self.data["network"]["restrict_first_stage"], bool):
+            raise ValueError("network.restrict_first_stage must be a boolean.")
+
     def combinations(self) -> list[dict[str, float | None]]:
         """Return the Cartesian product of configured parameter values."""
         value_lists = [
@@ -171,6 +193,51 @@ class SensitivityConfig:
         copied_config.data = copied_data
         copied_config._validate()
         return copied_config
+
+    def with_path_preprocessing(
+        self,
+        *,
+        path_limit: int,
+        path_mode: str,
+        cost_seed_pairs: tuple[tuple[float, float], ...] | None = None,
+    ) -> SensitivityConfig:
+        """Copy this config with the route-preprocessing inputs replaced.
+
+        ``seed_union`` obtains its seeds from ``parameter_values``.  Supplying
+        ``cost_seed_pairs`` is therefore useful for analyses that intentionally
+        use one cost vector rather than the entire sensitivity grid.
+        """
+        copied_data = _merge_defaults({}, self.data)
+        copied_data["network"]["recourse_path_limit"] = path_limit
+        copied_data["network"]["feasible_path_mode"] = path_mode
+        if cost_seed_pairs is not None:
+            copied_data["parameter_values"]["cost_flight"] = [
+                pair[0] for pair in cost_seed_pairs
+            ]
+            copied_data["parameter_values"]["cost_ground"] = [
+                pair[1] for pair in cost_seed_pairs
+            ]
+
+        copied_config = object.__new__(SensitivityConfig)
+        copied_config.path = self.path
+        copied_config.data = copied_data
+        copied_config._validate()
+        return copied_config
+
+    def cost_seed_pairs(self) -> tuple[tuple[float, float], ...]:
+        """Return stable, de-duplicated air/ground cost seeds for Yen paths."""
+        air_costs = self.data["parameter_values"].get(
+            "cost_flight", [self.data["base_parameters"]["cost_flight"]]
+        )
+        ground_costs = self.data["parameter_values"].get(
+            "cost_ground", [self.data["base_parameters"]["cost_ground"]]
+        )
+        return tuple(
+            dict.fromkeys(
+                (float(air_cost), float(ground_cost))
+                for air_cost, ground_cost in itertools.product(air_costs, ground_costs)
+            )
+        )
 
 
 def _write_json_atomic(path: Path, payload: Any) -> None:
@@ -202,6 +269,7 @@ class ProblemPreparer:
 
     def __init__(self, config: SensitivityConfig) -> None:
         self.config = config.data
+        self.cost_seed_pairs = config.cost_seed_pairs()
         self.rng = np.random.default_rng(self.config["seed"])
 
     def prepare(self) -> PreparedProblem:
@@ -236,11 +304,20 @@ class ProblemPreparer:
         if not shipments:
             raise ValueError("No valid overlapping shipments were found.")
 
-        feasible_routes_by_shipment = build_feasible_routes_by_shipment(
-            shipments,
-            legs,
-            max_paths=int(self.config["network"]["recourse_path_limit"]),
-        )
+        path_limit = int(self.config["network"]["recourse_path_limit"])
+        path_mode = self.config["network"]["feasible_path_mode"]
+        cost_seed_pairs = self.cost_seed_pairs
+        if path_mode == "distance_only":
+            feasible_routes_by_shipment = build_feasible_routes_by_shipment(
+                shipments, legs, max_paths=path_limit
+            )
+        else:
+            feasible_routes_by_shipment = build_seed_union_feasible_routes_by_shipment(
+                shipments,
+                legs,
+                cost_seed_pairs=cost_seed_pairs,
+                max_paths=path_limit,
+            )
         feasible_air_routes = {
             route
             for routes in feasible_routes_by_shipment.values()
@@ -259,6 +336,9 @@ class ProblemPreparer:
             seed=int(self.config["seed"]),
             num_scenarios=int(self.config["num_scenarios"]),
             feasible_routes_by_shipment=feasible_routes_by_shipment,
+            feasible_path_mode=path_mode,
+            recourse_path_limit=path_limit,
+            cost_seed_pairs=cost_seed_pairs if path_mode == "seed_union" else (),
         )
 
     @staticmethod
@@ -574,12 +654,13 @@ class SensitivityRunner:
                 StochasticOptimizationParameters(**parameter_values),
             )
             model.optimize()
-            self._validate_first_stage_routes(
-                run_index,
-                model,
-                solver,
-                first_stage,
-            )
+            if self.config.data["network"]["restrict_first_stage"]:
+                self._validate_first_stage_routes(
+                    run_index,
+                    model,
+                    solver,
+                    first_stage,
+                )
 
             result = self._build_result(
                 run_index,
@@ -608,6 +689,7 @@ class SensitivityRunner:
         whose inputs change the constraint matrix, such as route-limit
         sensitivity, where reusing a model across cases is not valid.
         """
+        recourse_connectivity = self._recourse_connectivity()
         model, solver, first_stage, keep, reassign = self._build_model()
         self._set_cost_objective(
             model,
@@ -619,8 +701,9 @@ class SensitivityRunner:
         )
         model.optimize()
         # breakpoint()
-        self._validate_first_stage_routes(run_label, model, solver, first_stage)
-        return self._build_result(
+        if self.config.data["network"]["restrict_first_stage"]:
+            self._validate_first_stage_routes(run_label, model, solver, first_stage)
+        result = self._build_result(
             None,
             parameters,
             model,
@@ -629,6 +712,61 @@ class SensitivityRunner:
             keep,
             reassign,
         )
+        result["recourse_connectivity"] = recourse_connectivity
+        return result
+
+    def _recourse_connectivity(self) -> dict[str, Any]:
+        """Report scenario/path-set combinations with no available OD path.
+
+        The second stage requires a complete route in every sampled scenario.
+        Thus one unavailable cut in a small candidate-path union is sufficient
+        to make the corresponding model infeasible.  This check uses the same
+        air-leg availability rule as ``TwoStageSolver.stage_two_setup``.
+        """
+        feasible_routes = self.prepared.feasible_routes_by_shipment
+        if feasible_routes is None:
+            return {"checked": False, "unreachable_scenario_count": None}
+
+        examples: list[dict[str, Any]] = []
+        unreachable_count = 0
+        for shipment_id, shipment in self.prepared.shipments.items():
+            routes = feasible_routes[shipment_id]
+            for scenario_index in range(self.prepared.num_scenarios):
+                outgoing: dict[str, list[str]] = {}
+                for route in routes:
+                    is_available = route[2] == "ground" or (
+                        self.prepared.scenarios[route].scenario_realize[scenario_index]
+                        >= shipment.weight
+                    )
+                    if is_available:
+                        outgoing.setdefault(route[0], []).append(route[1])
+
+                reached = {shipment.origin.node_id}
+                frontier = [shipment.origin.node_id]
+                while frontier:
+                    node = frontier.pop()
+                    for next_node in outgoing.get(node, ()):
+                        if next_node not in reached:
+                            reached.add(next_node)
+                            frontier.append(next_node)
+
+                if shipment.destination.node_id not in reached:
+                    unreachable_count += 1
+                    if len(examples) < 20:
+                        examples.append(
+                            {
+                                "shipment_id": shipment_id,
+                                "scenario_index": scenario_index,
+                                "origin": shipment.origin.node_id,
+                                "destination": shipment.destination.node_id,
+                            }
+                        )
+
+        return {
+            "checked": True,
+            "unreachable_scenario_count": unreachable_count,
+            "unreachable_examples": examples,
+        }
 
     def _build_model(self) -> tuple[Any, TwoStageSolver, Any, Any, Any]:
         """Create the fixed model and decision variables for one prepared input."""
@@ -656,6 +794,9 @@ class SensitivityRunner:
             feasible_routes_by_shipment=feasible_routes,
             recourse_path_limit=int(
                 self.config.data["network"]["recourse_path_limit"]
+            ),
+            restrict_first_stage=bool(
+                self.config.data["network"]["restrict_first_stage"]
             ),
         )
 
@@ -893,6 +1034,21 @@ class SensitivityRunner:
             "parameters": parameters,
             "seed": self.prepared.seed,
             "num_scenarios": self.prepared.num_scenarios,
+            "feasible_path_mode": getattr(
+                self.prepared, "feasible_path_mode", "distance_only"
+            ),
+            "recourse_path_limit": getattr(
+                self.prepared, "recourse_path_limit", None),
+            "recourse_path_limits_by_shipment": getattr(
+                self.prepared, "recourse_path_limits_by_shipment", None
+            ),
+            "cost_seed_pairs": [
+                list(pair)
+                for pair in getattr(self.prepared, "cost_seed_pairs", ())
+            ],
+            "restrict_first_stage": bool(
+                self.config.data["network"]["restrict_first_stage"]
+            ),
             "status": int(model.Status),
             "objective_value": float(model.ObjVal) if has_solution else None,
             "runtime_seconds": float(model.Runtime),
@@ -946,6 +1102,174 @@ class SensitivityRunner:
                     )
             if scenario_decisions:
                 shipment_result["recourse"][str(scenario_index)] = scenario_decisions
+
+
+def _routes_from_paths(paths: Sequence[tuple[RouteKey, ...]]) -> tuple[RouteKey, ...]:
+    """Return an ordered route union without changing the path count."""
+    return tuple(dict.fromkeys(route for path in paths for route in path))
+
+
+def _cost_weighted_path_unions(
+    shipments: dict[str, Shipment],
+    legs: dict[RouteKey, LegOption],
+    *,
+    air_cost: float,
+    ground_cost: float,
+    max_paths: int,
+) -> dict[str, tuple[tuple[RouteKey, ...], ...]]:
+    """Get each shipment's unique K-path union under baseline transport cost."""
+    unions: dict[str, tuple[tuple[RouteKey, ...], ...]] = {}
+    for shipment_id, shipment in shipments.items():
+        def route_cost(route: RouteKey, leg: LegOption) -> float:
+            if route[2] == "air":
+                unit_cost = air_cost
+            elif route[2] == "ground":
+                unit_cost = ground_cost
+            else:
+                raise ValueError(f"Route {route!r} has unsupported mode")
+            return shipment.weight * leg.distance_miles * unit_cost
+
+        paths = tuple(dict.fromkeys(k_shortest_route_paths(
+            legs,
+            shipment.origin.node_id,
+            shipment.destination.node_id,
+            max_paths=max_paths,
+            route_cost=route_cost,
+        )))
+        if not paths or not any(paths):
+            raise ValueError(f"No directed route path for shipment {shipment_id!r}")
+        unions[shipment_id] = paths
+    return unions
+
+
+def _distance_paths_with_matching_counts(
+    shipments: dict[str, Shipment],
+    legs: dict[RouteKey, LegOption],
+    path_counts: dict[str, int],
+) -> dict[str, tuple[tuple[RouteKey, ...], ...]]:
+    """Return exactly the requested number of strictly distance-ranked paths."""
+    matched: dict[str, tuple[tuple[RouteKey, ...], ...]] = {}
+    for shipment_id, shipment in shipments.items():
+        requested_count = path_counts[shipment_id]
+        paths = k_shortest_route_paths(
+            legs,
+            shipment.origin.node_id,
+            shipment.destination.node_id,
+            max_paths=requested_count,
+        )
+        if len(paths) != requested_count:
+            raise ValueError(
+                f"Shipment {shipment_id!r} has only {len(paths)} strictly distance-"
+                f"ranked paths; cannot match its cost-weighted union of "
+                f"{requested_count} paths."
+            )
+        matched[shipment_id] = paths
+    return matched
+
+
+class MatchedPathSensitivityRunner:
+    """Compare every configured seed-union K with equal-count distance paths.
+
+    The cost branch uses all configured cost seeds plus raw distance. Its distinct paths
+    form a per-shipment union, whose size becomes the K used by the distance
+    branch for that shipment.  This avoids treating a shared global K as if it
+    represented an equal candidate-path count for all shipments.
+    """
+
+    def __init__(self, config: SensitivityConfig) -> None:
+        self.config = config
+
+    def run(self, output_dir: Path) -> list[Path]:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        baseline = dict(self.config.data["base_parameters"])
+        cost_pairs = self.config.cost_seed_pairs()
+
+        results: list[dict[str, Any]] = []
+        result_paths: list[Path] = []
+        for path_limit in ROUTE_PATH_LIMITS:
+            # Prepare exactly the same seed union and scenarios as K sensitivity.
+            cost_config = self.config.with_path_preprocessing(
+                path_limit=path_limit,
+                path_mode="seed_union",
+            )
+            cost_prepared = ProblemPreparer(cost_config).prepare()
+            cost_paths = build_seed_union_paths_by_shipment(
+                cost_prepared.shipments,
+                cost_prepared.legs,
+                cost_seed_pairs=cost_pairs,
+                max_paths=path_limit,
+            )
+            path_counts = {
+                shipment_id: len(paths) for shipment_id, paths in cost_paths.items()
+            }
+            cost_prepared.recourse_path_limits_by_shipment = path_counts
+
+            distance_config = self.config.with_path_preprocessing(
+                path_limit=max(path_counts.values()), path_mode="distance_only"
+            )
+            distance_prepared = ProblemPreparer(distance_config).prepare()
+            distance_paths = _distance_paths_with_matching_counts(
+                distance_prepared.shipments, distance_prepared.legs, path_counts
+            )
+            distance_prepared.feasible_routes_by_shipment = {
+                shipment_id: _routes_from_paths(paths)
+                for shipment_id, paths in distance_paths.items()
+            }
+            distance_prepared.recourse_path_limit = None
+            distance_prepared.recourse_path_limits_by_shipment = path_counts
+
+            case_results: list[dict[str, Any]] = []
+            for filename, label, case_config, prepared in (
+                (
+                    f"cost_weighted_k_{path_limit:03d}.json",
+                    f"Seed-union K sensitivity (K={path_limit})",
+                    cost_config,
+                    cost_prepared,
+                ),
+                (
+                    f"distance_only_matched_k_{path_limit:03d}.json",
+                    f"Distance-only matched-K sensitivity (cost K={path_limit})",
+                    distance_config,
+                    distance_prepared,
+                ),
+            ):
+                result = SensitivityRunner(case_config, prepared).solve_once(
+                    baseline, run_label=label
+                )
+                result["cost_weighted_path_limit"] = path_limit
+                result["matched_distance_path_limits_by_shipment"] = path_counts
+                path = output_dir / filename
+                _write_json_atomic(path, result)
+                case_results.append(result)
+                result_paths.append(path)
+            results.append({"cost_weighted_path_limit": path_limit, "cases": case_results})
+
+        summary_path = output_dir / "matched_k_summary.json"
+        _write_json_atomic(
+            summary_path,
+            {
+                "analysis": "matched_cost_weighted_vs_distance_path_sensitivity",
+                "base_parameters": baseline,
+                "route_path_limits": list(ROUTE_PATH_LIMITS),
+                "results": [
+                    {
+                        "cost_weighted_path_limit": row["cost_weighted_path_limit"],
+                        "cases": [
+                            {
+                                "feasible_path_mode": result["feasible_path_mode"],
+                                "status": result["status"],
+                                "objective_value": result["objective_value"],
+                                "runtime_seconds": result["runtime_seconds"],
+                            }
+                            for result in row["cases"]
+                        ],
+                    }
+                    for row in results
+                ],
+            },
+        )
+        result_paths.append(summary_path)
+        return result_paths
 
 
 class RouteLimitSensitivityRunner:
@@ -1049,6 +1373,14 @@ def _build_parser() -> argparse.ArgumentParser:
             "base_parameters."
         ),
     )
+    command.add_argument(
+        "--matched-k-sensitivity",
+        action="store_true",
+        help=(
+            "Compare configured seed-union paths with strictly distance-ranked "
+            "paths, using each shipment's unique seed-union size as its distance K."
+        ),
+    )
     return parser
 
 
@@ -1056,13 +1388,21 @@ def main(argv: list[str] | None = None) -> None:
     args = _build_parser().parse_args(sys.argv[1:] if argv is None else argv)
     args.config = _relative_to_script(args.config)
     args.prepared_problem = _relative_to_script(args.prepared_problem)
-    if args.k_sensitivity and not args.output_dir_explicit:
+    if (
+        args.k_sensitivity or args.matched_k_sensitivity
+    ) and not args.output_dir_explicit:
         args.output_dir = Path("output/k_sensitivity")
     args.output_dir = _relative_to_script(args.output_dir)
     config = SensitivityConfig(args.config)
 
     if args.k_sensitivity:
         result_paths = RouteLimitSensitivityRunner(config).run(args.output_dir)
+        for result_path in result_paths:
+            print(result_path)
+        return
+
+    if args.matched_k_sensitivity:
+        result_paths = MatchedPathSensitivityRunner(config).run(args.output_dir)
         for result_path in result_paths:
             print(result_path)
         return
