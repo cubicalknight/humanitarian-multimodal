@@ -54,6 +54,82 @@ After every array task completes, merge its detailed results:
 poetry run python src/main.py --config sensitivity_config.json --output-dir ../run_outputs/sensitivity/results --merge
 ```
 
+## Base-case integrated versus myopic comparison
+
+```bash
+poetry run python src/main.py --base-case-comparison
+```
+
+This prepares one shared network and scenario sample, then runs integrated and
+myopic optimization with both restricted and unrestricted first-stage routing.
+All four cases use `base_parameters`. Preprocessing always uses `seed_union`:
+the configured air/ground cost grid plus distance paths, with
+`network.recourse_path_limit` paths per ranking (default 10).
+
+Myopic cases minimize first-stage transportation cost before adding recourse,
+fix every first-stage decision, and then optimize recourse. Both methods retain
+the existing recourse restrictions and unused-assignment refunds. Total expected
+cost equals first-stage transportation cost plus expected **net** recourse cost;
+the latter includes refunds and can be negative. Selected legs outside the
+recourse set retain their original first-stage charge.
+
+Only `myopic_unrestricted` allows selected, available air legs to be dropped in
+recourse (`keep <= x * availability`). All other production cases require these
+air legs to be kept. Final routing remains inside each shipment's feasible set;
+outside-set recourse is implicitly zero. Results record `allow_air_leg_dropping`.
+The unrestricted integrated/myopic comparison therefore also differs in its
+retention rule, and is not a pure comparison of solution methods.
+
+To separately test this relaxation in standard restricted integrated SAA:
+
+```bash
+poetry run python tests/smoke_saa_air_leg_dropping.py
+```
+
+This diagnostic prepares one shared seed-union problem and solves mandatory and
+optional retention jointly at the configured `base_parameters`, with first-stage
+decisions free in both solves. It writes detailed results and `summary.json` to
+`src/output/saa_air_leg_dropping_smoke/`. Use `--config` and `--output-dir` to
+override these paths; explicit relative paths resolve from the working directory.
+Reports include costs, objective bounds, MIP gaps, runtimes, and selected available
+air legs dropped (counted per shipment, leg, and scenario). Nonzero MIP gaps can
+explain small incumbent cost differences even when both statuses are optimal
+within the solver's tolerance.
+
+Results default to `src/output/base_case_comparison/`: four files named
+`{integrated,myopic}_{restricted,unrestricted}.json` and `summary.json`.
+Use `--output-dir` to override this directory (relative to `src/`). No separate
+`--prepare` step is needed. Detailed files include decisions, stage statuses and
+runtimes, cost components, and route-membership diagnostics. The summary reports
+myopic minus integrated total costs and percentages relative to integrated cost.
+
+Unrestricted route-membership violations produce warnings and are saved without
+stopping the comparison. Cases without incumbents have unavailable costs marked
+`null`; failed myopic recourse retains the first-stage decisions. Early-stopped
+solves use their incumbents and retain solver statuses; each optimization receives
+the configured solver limits. Restricted route-membership violations remain errors.
+
+### Plot the base-case comparison
+
+```bash
+poetry run python src/plot_base_case_comparison.py
+```
+
+Reads the four detailed case files from `src/output/base_case_comparison/` and
+writes five PDFs to `src/output/figures/base_case_comparison/`: `objective.pdf`,
+`first_stage_ground_links.pdf`, `first_stage_air_links.pdf`,
+`final_ground_links.pdf`, and `final_air_links.pdf`.
+The objective figure contains all four cases. Link bars show means with min–max
+whiskers across shipments (first stage) or shipment/scenario pairs (recourse).
+Final figures separately show kept, reassigned, and combined active links.
+These are counts of distinct active legs, not sums of fractional flow; combined
+counts use `keep + reassign` and need not equal the sum of the separate counts.
+
+Use `--input-dir`, `--output-dir`, and `--active-threshold` (default `1e-6`)
+to customize the plots. Explicit relative paths resolve from the working directory.
+Cases without a final incumbent are marked as unavailable, while saved myopic
+first-stage assignments are still plotted when recourse fails.
+
 ## Feasible-route K sensitivity
 
 These analyses vary the candidate-path limit while solving at fixed

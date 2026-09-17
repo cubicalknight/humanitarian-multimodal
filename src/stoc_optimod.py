@@ -659,8 +659,12 @@ class TwoStageSolver:
         return model, x, cost
     
 
-    def stage_two_setup(self, model, x, Omega, scenarios):
-        """Build recourse variables only on each shipment's feasible route set."""
+    def stage_two_setup(self, model, x, Omega, scenarios, *, allow_air_leg_dropping=False):
+        """Build sparse recourse, optionally allowing selected air legs to be dropped.
+
+        Outside-set recourse remains implicitly zero in either formulation.
+        The default requires every selected, available air leg to be retained.
+        """
         print("Setting up second stage optimization...")
 
         if self.solver_quiet:
@@ -732,6 +736,13 @@ class TwoStageSolver:
         model.addConstrs(
             (
                 still_avail[s, *route, om]
+                <= x[s, *route]
+                * (
+                    scenarios[route].scenario_realize[om]
+                    >= self.shipments[s].weight
+                )
+                if route[2] == "air" and allow_air_leg_dropping
+                else still_avail[s, *route, om]
                 == x[s, *route]
                 * (
                     scenarios[route].scenario_realize[om]

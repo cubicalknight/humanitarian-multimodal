@@ -14,6 +14,8 @@ feasible-route limit with the baseline cost parameters.
 Use ``--matched-k-sensitivity`` to compare each configured seed-union
 path limit against a per-shipment, strictly distance-ranked path
 count.
+Use ``--base-case-comparison`` for integrated and myopic baseline solves
+with restricted and unrestricted first-stage routing.
 """
 
 from __future__ import annotations
@@ -26,6 +28,7 @@ import os
 import pickle
 import sys
 from collections.abc import Sequence
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -86,7 +89,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "max_ground_distance_miles": 500.0,
         "recourse_path_limit": 10,
         "feasible_path_mode": "distance_only",
-        "restrict_first_stage": True,
+        "restrict_first_stage": False,
     },
 }
 
@@ -116,7 +119,7 @@ class PreparedProblem:
 
 def _merge_defaults(given: dict[str, Any], defaults: dict[str, Any]) -> dict[str, Any]:
     """Recursively merge a user config with the supported defaults."""
-    merged = dict(defaults)
+    merged = deepcopy(defaults)
     for key, value in given.items():
         if isinstance(value, dict) and isinstance(defaults.get(key), dict):
             merged[key] = _merge_defaults(value, defaults[key])
@@ -185,7 +188,7 @@ class SensitivityConfig:
 
     def with_recourse_path_limit(self, path_limit: int) -> SensitivityConfig:
         """Return an independently configurable copy with one route limit."""
-        copied_data = _merge_defaults({}, self.data)
+        copied_data = deepcopy(self.data)
         copied_data["network"]["recourse_path_limit"] = path_limit
 
         copied_config = object.__new__(SensitivityConfig)
@@ -207,7 +210,7 @@ class SensitivityConfig:
         ``cost_seed_pairs`` is therefore useful for analyses that intentionally
         use one cost vector rather than the entire sensitivity grid.
         """
-        copied_data = _merge_defaults({}, self.data)
+        copied_data = deepcopy(self.data)
         copied_data["network"]["recourse_path_limit"] = path_limit
         copied_data["network"]["feasible_path_mode"] = path_mode
         if cost_seed_pairs is not None:
@@ -715,6 +718,97 @@ class SensitivityRunner:
         result["recourse_connectivity"] = recourse_connectivity
         return result
 
+    def solve_comparison_case(self, *, method: str, run_label: str) -> dict[str, Any]:
+        """Solve a baseline case, preserving myopic decisions if recourse fails."""
+        if method not in {"integrated", "myopic"}:
+            raise ValueError(f"Unknown comparison method: {method}")
+        parameters = dict(self.config.data["base_parameters"])
+        params = StochasticOptimizationParameters(**parameters)
+        allow_air_leg_dropping = (
+            method == "myopic" and not self.config.data["network"]["restrict_first_stage"]
+        )
+        model, solver, first_stage, keep, reassign = self._build_model(
+            first_stage_only=method == "myopic"
+        )
+        stages = {}
+        saved_decisions = {}
+        first_stage_cost = None
+
+        def record_stage(name: str) -> None:
+            stages[name] = {
+                "status": int(model.Status),
+                "solution_count": int(model.SolCount),
+                "runtime_seconds": float(model.Runtime),
+            }
+
+        try:
+            if method == "myopic":
+                self._set_first_stage_cost_objective(model, solver, first_stage, params)
+            else:
+                self._set_cost_objective(model, solver, first_stage, keep, reassign, params)
+            model.optimize()
+            record_stage("first_stage" if method == "myopic" else "integrated")
+            diagnostics = self._first_stage_route_diagnostics(model, solver, first_stage)
+            if self.config.data["network"]["restrict_first_stage"]:
+                self._validate_first_stage_routes(run_label, model, solver, first_stage)
+            elif diagnostics["violations"]:
+                print(f"Warning: {run_label}: first-stage routes outside recourse sets "
+                      f"for {len(diagnostics['violations'])} shipment(s); continuing.")
+
+            if model.SolCount:
+                # Snapshot before modifying the model invalidates solution attributes.
+                values = {key: round(variable.X) for key, variable in first_stage.items()}
+                first_stage_cost = sum(
+                    values[s, *route] * solver.shipments[s].weight
+                    * solver.legs[route].distance_miles
+                    * (params.cost_flight if route[2] == "air" else params.cost_ground)
+                    for s in solver.S for route in solver.R
+                )
+                for shipment_id in solver.S:
+                    saved_decisions[shipment_id] = {"first_stage": [], "recourse": {}}
+                    self._add_first_stage_decisions(
+                        saved_decisions[shipment_id], shipment_id, solver, first_stage
+                    )
+                if method == "myopic":
+                    for key, variable in first_stage.items():
+                        variable.LB = values[key]
+                        variable.UB = values[key]
+                    model, keep, reassign, _ = solver.stage_two_setup(
+                        model, first_stage, range(self.prepared.num_scenarios),
+                        self.prepared.scenarios,
+                        allow_air_leg_dropping=allow_air_leg_dropping,
+                    )
+                    self._configure_gurobi(model, self.config.data["solver"])
+                    self._set_cost_objective(
+                        model, solver, first_stage, keep, reassign, params
+                    )
+                    model.optimize()
+                    record_stage("recourse")
+
+            result = self._build_result(
+                None, parameters, model, solver, first_stage, keep, reassign
+            )
+            if not model.SolCount and saved_decisions:
+                result["decision_variables_by_shipment"] = saved_decisions
+            total_cost = result["objective_value"]
+            result.update({
+                "case": run_label,
+                "method": method,
+                "allow_air_leg_dropping": allow_air_leg_dropping,
+                "stages": stages,
+                "first_stage_validation": diagnostics,
+                "first_stage_cost": first_stage_cost,
+                "expected_net_recourse_cost": (
+                    total_cost - first_stage_cost if total_cost is not None else None
+                ),
+                "total_expected_cost": total_cost,
+                "runtime_seconds": sum(stage["runtime_seconds"] for stage in stages.values()),
+                "recourse_connectivity": self._recourse_connectivity(),
+            })
+            return result
+        finally:
+            model.dispose()
+
     def _recourse_connectivity(self) -> dict[str, Any]:
         """Report scenario/path-set combinations with no available OD path.
 
@@ -768,7 +862,7 @@ class SensitivityRunner:
             "unreachable_examples": examples,
         }
 
-    def _build_model(self) -> tuple[Any, TwoStageSolver, Any, Any, Any]:
+    def _build_model(self, *, first_stage_only: bool = False) -> tuple[Any, TwoStageSolver, Any, Any, Any]:
         """Create the fixed model and decision variables for one prepared input."""
         solver_options = self.config.data["solver"]
         feasible_routes = getattr(
@@ -803,6 +897,10 @@ class SensitivityRunner:
         model, first_stage, first_stage_cost = solver.stage_one_setup(
             gp.Model("sensitivity")
         )
+        if first_stage_only:
+            self._configure_gurobi(model, solver_options)
+            model.setObjective(0.0, gp.GRB.MINIMIZE)
+            return model, solver, first_stage, None, None
         model, keep, reassign, recourse_cost = solver.stage_two_setup(
             model,
             first_stage,
@@ -819,19 +917,15 @@ class SensitivityRunner:
         return model, solver, first_stage, keep, reassign
 
     @staticmethod
-    def _validate_first_stage_routes(
-        run_index: int | str,
+    def _first_stage_route_diagnostics(
         model: gp.Model,
         solver: TwoStageSolver,
         first_stage: Any,
-    ) -> None:
-        """Fail fast when the unrestricted first stage leaves sparse recourse."""
+    ) -> dict[str, Any]:
+        """Describe selected legs outside shipment-specific recourse sets."""
         if model.SolCount == 0:
-            return
-
-        violations: list[
-            tuple[str, tuple[RouteKey, ...], tuple[RouteKey, ...]]
-        ] = []
+            return {"checked": False, "passed": None, "violations": []}
+        violations = []
         for shipment_id in solver.S:
             feasible_routes = solver.feasible_route_sets[shipment_id]
             selected_routes = tuple(
@@ -843,25 +937,41 @@ class SensitivityRunner:
                 route for route in selected_routes if route not in feasible_routes
             )
             if routes_outside_recourse_set:
-                violations.append(
-                    (shipment_id, selected_routes, routes_outside_recourse_set)
-                )
+                violations.append({
+                    "shipment_id": shipment_id,
+                    "intended_origin": solver.shipments[shipment_id].origin.node_id,
+                    "intended_destination": solver.shipments[shipment_id].destination.node_id,
+                    "selected_first_stage_routes": selected_routes,
+                    "routes_outside_recourse_set": routes_outside_recourse_set,
+                })
+        return {"checked": True, "passed": not violations, "violations": violations}
 
+    @staticmethod
+    def _validate_first_stage_routes(
+        run_index: int | str,
+        model: gp.Model,
+        solver: TwoStageSolver,
+        first_stage: Any,
+    ) -> None:
+        """Fail fast when the first stage leaves sparse recourse."""
+        violations = SensitivityRunner._first_stage_route_diagnostics(
+            model, solver, first_stage
+        )["violations"]
         if violations:
             details = "\n".join(
                 "\n".join(
                     (
-                        f"  shipment={shipment_id!r}",
+                        f"  shipment={violation['shipment_id']!r}",
                         "    intended_origin="
-                        f"{solver.shipments[shipment_id].origin.node_id!r}",
+                        f"{violation['intended_origin']!r}",
                         "    intended_destination="
-                        f"{solver.shipments[shipment_id].destination.node_id!r}",
-                        f"    selected_first_stage_routes={selected_routes!r}",
+                        f"{violation['intended_destination']!r}",
+                        f"    selected_first_stage_routes={violation['selected_first_stage_routes']!r}",
                         "    routes_outside_recourse_set="
-                        f"{routes_outside_recourse_set!r}",
+                        f"{violation['routes_outside_recourse_set']!r}",
                     )
                 )
-                for shipment_id, selected_routes, routes_outside_recourse_set in violations
+                for violation in violations
             )
             raise RuntimeError(
                 f"Sensitivity run {run_index} selected first-stage routes outside "
@@ -1324,6 +1434,66 @@ class RouteLimitSensitivityRunner:
         return result_paths
 
 
+class BaseCaseComparisonRunner:
+    """Compare integrated and sequential decisions using one shared sample."""
+
+    def __init__(self, config: SensitivityConfig) -> None:
+        self.config = config
+
+    def run(self, output_dir: Path) -> list[Path]:
+        config = self.config.with_path_preprocessing(
+            path_limit=self.config.data["network"]["recourse_path_limit"],
+            path_mode="seed_union",
+        )
+        prepared = ProblemPreparer(config).prepare()
+        output_dir.mkdir(parents=True, exist_ok=True)
+        results = {}
+        paths = []
+        for method in ("integrated", "myopic"):
+            for restricted in (True, False):
+                label = f"{method}_{'restricted' if restricted else 'unrestricted'}"
+                case_config = config.with_recourse_path_limit(
+                    config.data["network"]["recourse_path_limit"]
+                )
+                case_config.data["network"]["restrict_first_stage"] = restricted
+                result = SensitivityRunner(case_config, prepared).solve_comparison_case(
+                    method=method, run_label=label
+                )
+                path = output_dir / f"{label}.json"
+                _write_json_atomic(path, result)
+                paths.append(path)
+                results[label] = result
+        differences = {}
+        for restriction in ("restricted", "unrestricted"):
+            integrated = results[f"integrated_{restriction}"]["total_expected_cost"]
+            myopic = results[f"myopic_{restriction}"]["total_expected_cost"]
+            delta = myopic - integrated if integrated is not None and myopic is not None else None
+            differences[restriction] = {
+                "myopic_minus_integrated": delta,
+                "percentage_of_integrated": 100 * delta / integrated
+                if delta is not None and integrated != 0 else None,
+            }
+        summary = {
+            "analysis": "base_case_comparison",
+            "base_parameters": dict(config.data["base_parameters"]),
+            "results": [
+                {key: value for key, value in result.items()
+                 if key not in {"decision_variables_by_shipment", "recourse_connectivity",
+                                "first_stage_validation"}}
+                | {"first_stage_validation": {
+                    "checked": result["first_stage_validation"]["checked"],
+                    "passed": result["first_stage_validation"]["passed"],
+                    "violation_count": len(result["first_stage_validation"]["violations"]),
+                }}
+                for result in results.values()
+            ],
+            "cost_differences": differences,
+        }
+        summary_path = output_dir / "summary.json"
+        _write_json_atomic(summary_path, summary)
+        return paths + [summary_path]
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.set_defaults(output_dir_explicit=False)
@@ -1349,7 +1519,8 @@ def _build_parser() -> argparse.ArgumentParser:
         action=_StoreOutputDirectory,
         help=(
             "Result directory. Defaults to output/sensitivity/results for cost "
-            "commands and output/k_sensitivity for --k-sensitivity."
+            "commands, output/k_sensitivity for K sensitivity, and "
+            "output/base_case_comparison for --base-case-comparison."
         ),
     )
 
@@ -1365,6 +1536,10 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     command.add_argument("--print-run-count", action="store_true")
     command.add_argument("--merge", action="store_true")
+    command.add_argument(
+        "--base-case-comparison", action="store_true",
+        help="Compare integrated and myopic baseline routing, restricted and unrestricted.",
+    )
     command.add_argument(
         "--k-sensitivity",
         action="store_true",
@@ -1393,7 +1568,14 @@ def main(argv: list[str] | None = None) -> None:
     ) and not args.output_dir_explicit:
         args.output_dir = Path("output/k_sensitivity")
     args.output_dir = _relative_to_script(args.output_dir)
+    if args.base_case_comparison and not args.output_dir_explicit:
+        args.output_dir = SCRIPT_DIR / "output/base_case_comparison"
     config = SensitivityConfig(args.config)
+
+    if args.base_case_comparison:
+        for result_path in BaseCaseComparisonRunner(config).run(args.output_dir):
+            print(result_path)
+        return
 
     if args.k_sensitivity:
         result_paths = RouteLimitSensitivityRunner(config).run(args.output_dir)
