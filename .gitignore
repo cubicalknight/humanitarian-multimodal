@@ -17,5 +17,4 @@ src/sbi-logs/
 *.pdf
 *.ilp
 /src/output
-/tests
 /src/cache

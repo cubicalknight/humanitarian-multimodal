@@ -102,6 +102,17 @@ def _relative_to_script(path: Path) -> Path:
 
 
 @dataclass(slots=True)
+class PreparedNetwork:
+    """Shared deterministic inputs, including the original shipment airports."""
+
+    shipments: dict[str, Shipment]
+    legs: dict[RouteKey, LegOption]
+    nodes: dict[str, Node]
+    recorded_airports: dict[str, tuple[str, str]]
+    t100_processor: T100DataProcessing
+
+
+@dataclass(slots=True)
 class PreparedProblem:
     """The immutable input shared by all sensitivity-array tasks."""
 
@@ -275,8 +286,8 @@ class ProblemPreparer:
         self.cost_seed_pairs = config.cost_seed_pairs()
         self.rng = np.random.default_rng(self.config["seed"])
 
-    def prepare(self) -> PreparedProblem:
-        """Prepare shipments, network legs, and common random-number scenarios."""
+    def prepare_network(self) -> PreparedNetwork:
+        """Build exactly the deterministic network used by optimization."""
         t100_processor = T100DataProcessing()
         t100_processor.rng = np.random.default_rng(self.config["seed"])
 
@@ -306,6 +317,20 @@ class ProblemPreparer:
             )
         if not shipments:
             raise ValueError("No valid overlapping shipments were found.")
+
+        recorded_airports = {
+            str(row["Shipment ID"]): (str(row["ORIGIN"]), str(row["DEST"]))
+            for row in overlap.iter_rows(named=True)
+            if row["AW (lbs)"] is not None and not float(row["AW (lbs)"]) <= 0
+            and str(row["Shipment ID"]) in shipments
+        }
+        return PreparedNetwork(shipments, legs, nodes, recorded_airports, t100_processor)
+
+    def prepare(self) -> PreparedProblem:
+        """Prepare shipments, network legs, and common random-number scenarios."""
+        network = self.prepare_network()
+        shipments, legs = network.shipments, network.legs
+        t100_processor = network.t100_processor
 
         path_limit = int(self.config["network"]["recourse_path_limit"])
         path_mode = self.config["network"]["feasible_path_mode"]
