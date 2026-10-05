@@ -1,6 +1,8 @@
 #!/usr/bin/env python
+import argparse
 import datetime
 import json
+import math
 import os
 import pathlib
 import sys
@@ -44,11 +46,14 @@ class SyntheticGeneratorConfig:
         Number of weight sweeps per flight.
     loguniform_low : float
         Lower bound for the log-uniform weight sweep.
+    w_d : float
+        Offset subtracted from slack when augmenting shipping weights.
     """
     seed: int = 42
     n_flights: int = 1
     k_swaps: int = 5
     loguniform_low: float = 100.
+    w_d: float = 500.0
 
 
 class HyperPrior:
@@ -132,7 +137,7 @@ class SyntheticDataGenerator:
                     print(f"Old index {idx} retrying with new index {new_idx}")
                     return sample_row(new_idx)
 
-            new_weight = slack_val - 5e2
+            new_weight = slack_val - self.config.w_d
             assert new_weight >= 0, f"new_weight={new_weight} is negative for slack_val={slack_val}"
             assert new_weight >= weight_val, f"new_weight={new_weight} is less than original weight_val={weight_val}"
 
@@ -614,9 +619,25 @@ def theta_sensitivity_check_aggregate(generator, n_theta=30, n_flights=40, n_gam
 
     return eps_agg_means, eps_agg_within
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--w-d",
+        type=float,
+        default=500.0,
+        help="Offset subtracted from slack when augmenting shipping weights.",
+    )
+    args = parser.parse_args()
+    if not math.isfinite(args.w_d) or args.w_d < 0:
+        parser.error("--w-d must be finite and nonnegative.")
+    return args
+
+
 if __name__ == "__main__":
     # _demo()
-    generator = SyntheticDataGenerator()
+    args = parse_args()
+    w_d_tag = str(args.w_d).removesuffix(".0")
+    generator = SyntheticDataGenerator(SyntheticGeneratorConfig(w_d=args.w_d))
 
     n_cats = len(generator.proc.cat_cols)
     print("cat_cols:", generator.proc.cat_cols)
@@ -709,7 +730,6 @@ if __name__ == "__main__":
     print("S=1 fraction (probe):", x_probe[:, :, -1].mean().item())
     print("theta probe std:", theta_probe.std(dim=0)[:5])
 
-    breakpoint()  # sanity check: inspect x_o, theta_probe, x_probe
 
     # generator._sample_flights(n_samples=40)  # match your actual n_flights per sim
     # mu_z = (generator.u_max_sel - generator.u_cargo_sel - generator.u_mail_sel
@@ -729,7 +749,7 @@ if __name__ == "__main__":
     # sanity: eps medians should span a meaningful fraction of z_T100's scale,
     # not be uniformly tiny or uniformly huge relative to it
 
-    run_id = f"run_{datetime.datetime.now(tz=datetime.UTC).strftime('%Y%m%d_%H%M%S')}_{os.environ.get('SLURM_JOB_ID', 'local')}"  # noqa: DTZ005
+    run_id = f"run_{datetime.datetime.now(tz=datetime.UTC).strftime('%Y%m%d_%H%M%S')}_{os.environ.get('SLURM_JOB_ID', 'local')}_w_d_{w_d_tag}"  # noqa: DTZ005
     base_run_dir = pathlib.Path("run_outputs") / run_id
     base_run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -841,7 +861,6 @@ if __name__ == "__main__":
         diagnostics["posterior_std_xo"] = samples_xo.std(dim=0).tolist()
         diagnostics["posterior_mean_xo"] = samples_xo.mean(dim=0).tolist()
 
-        breakpoint()
         diagnostics["z_gen_stats"] = {
             "median": float(np.median(generator.z_gen_sel)),
             "frac_zero": float((generator.z_gen_sel == 0).mean()),
@@ -919,13 +938,14 @@ if __name__ == "__main__":
     psi_mc_se = psi_std / np.sqrt(n_done)
 
     np.savez(
-        base_run_dir / "psi_bar.npz",
+        base_run_dir / f"psi_bar_w_d_{w_d_tag}.npz",
         psi_bar=psi_bar,
         psi_std=psi_std,
         psi_mc_se=psi_mc_se,
         n_design=generator.n_design,
         n_draws=n_done,
         final_round=num_rounds - 1,
+        w_d=generator.config.w_d,
     )
     print(f"Saved E[psi] from final round ({num_rounds - 1}) over {n_done} draws.")
     print(f"Max MC SE across coords: {psi_mc_se.max():.4g}")
