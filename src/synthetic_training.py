@@ -619,6 +619,43 @@ def theta_sensitivity_check_aggregate(generator, n_theta=30, n_flights=40, n_gam
 
     return eps_agg_means, eps_agg_within
 
+class TrialStandardizer(nn.Module):
+    """Scale each feature using shared statistics across simulations and trials."""
+
+    def __init__(self, x: torch.Tensor):
+        super().__init__()
+        self.register_buffer("mean", x.mean(dim=(0, 1)))
+        self.register_buffer("std", x.std(dim=(0, 1)).clamp_min(1e-7))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return (x - self.mean) / self.std
+
+
+def build_density_estimator(batch_theta: torch.Tensor, batch_x: torch.Tensor):
+    # SBI supplies the training subset here, so validation data do not fit the scaler.
+    n_design = batch_x.shape[-1] - 2
+    single_trial_embedding = FCEmbedding(
+        input_dim=n_design + 2,
+        num_hiddens=n_design * 2,
+        output_dim=n_design * 2,
+    )
+    embedding_net = nn.Sequential(
+        TrialStandardizer(batch_x),
+        PermutationInvariantEmbedding(
+            single_trial_embedding,
+            trial_net_output_dim=n_design * 2,
+        ),
+    )
+    return posterior_nn(
+        model="maf",
+        embedding_net=embedding_net,
+        hidden_features=min(n_design, 256),
+        num_transforms=5,
+        z_score_x="none",
+        z_score_theta="independent",
+    )(batch_theta, batch_x)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -695,26 +732,7 @@ if __name__ == "__main__":
     #     num_continuous_features=len(generator.proc.num_cols),
     # )
 
-    single_trial_embedding = FCEmbedding(
-        input_dim=generator.n_design + 2,# 668,
-        num_hiddens=generator.n_design * 2,
-    )
-
-    embedding_net = PermutationInvariantEmbedding(
-        single_trial_embedding,
-        generator.n_design * 2,
-    )
-
-    neural_posterior = posterior_nn(
-        model="maf",
-        embedding_net=embedding_net,
-        hidden_features=min(generator.n_design, 256),  # was n_design*2
-        num_transforms=5,  # was 5
-        z_score_x='independent',
-        z_score_theta='independent',
-    )
-
-    inference = NPE(prior, density_estimator=neural_posterior, device=device)
+    inference = NPE(prior, density_estimator=build_density_estimator, device=device)
 
     x_o = generator.observation()
 
