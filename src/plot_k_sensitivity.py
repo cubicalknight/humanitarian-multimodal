@@ -253,17 +253,17 @@ def plot_tables(tables: Mapping[str, pd.DataFrame], output_dir: Path) -> None:
     if missing_notes:
         axis.text(0.02, 0.98, "\n".join(missing_notes),
                   transform=axis.transAxes, va="top", fontsize=9)
-    axis.set(title="Objective", xlabel=xlabel, ylabel="Objective value")
+    axis.set(xlabel=xlabel, ylabel="Objective Value")
     axis.xaxis.set_major_locator(MaxNLocator(nbins=8, integer=True))
-    axis.legend(title="Case", frameon=False)
+    axis.legend(frameon=True)
     figure.tight_layout()
     _save_figure(figure, output_dir, "objective")
 
     for table_key, column, title, ylabel, stem in (
         ("recourse_scenarios", "n_ground_legs", "Final ground links per shipment",
-         "Average ground links", "ground_links"),
+         "Average Ground Links", "ground_links"),
         ("recourse_scenarios", "n_air_legs", "Final air links per shipment",
-         "Average air links", "air_links"),
+         "Average Air Links", "air_links"),
         ("first_stage_similarity", "jaccard_to_reference", "First-stage route similarity",
          "Jaccard similarity to largest K in each case", "first_stage_jaccard"),
         ("final_route_similarity", "jaccard_to_reference", "Final route similarity (keep + reassign)",
@@ -290,9 +290,9 @@ def plot_tables(tables: Mapping[str, pd.DataFrame], output_dir: Path) -> None:
             axis.set_ylim(-0.03, 1.03)
         else:
             axis.set_ylim(bottom=0)
-        axis.set(title=title, xlabel=xlabel, ylabel=ylabel)
+        axis.set(xlabel=xlabel, ylabel=ylabel)
         axis.xaxis.set_major_locator(MaxNLocator(nbins=8, integer=True))
-        axis.legend(title="Case", frameon=False)
+        axis.legend(frameon=True)
         figure.tight_layout()
         _save_figure(figure, output_dir, stem)
 

@@ -1,4 +1,4 @@
-"""Plot primary cost sensitivity as heatmaps faceted by incompatibility penalty.
+"""Plot cost sensitivity grids and penalty-response figures.
 
 Run from the project root, for example::
 
@@ -7,6 +7,11 @@ Run from the project root, for example::
 Final and reassigned links are distinct active links, averaged equally over all
 shipment--scenario pairs. Sparse omitted scenarios contribute zero; runs without
 an incumbent and missing parameter combinations remain unavailable.
+
+The penalty-response figure instead sums reassignment variable values, matching
+the expected-leg formula even for fractional recourse. Scenarios in these runs
+are equally likely (p_omega = 1 / num_scenarios). The range is not a confidence
+interval. Zero-penalty label changes alone do not establish route changes.
 """
 
 from __future__ import annotations
@@ -14,6 +19,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import warnings
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
@@ -32,6 +38,14 @@ LINK_METRICS = (
     "n_reassigned_ground_legs",
     "n_reassigned_air_legs",
 )
+EXPECTED_METRICS = (
+    "expected_reassigned_air_legs", "expected_reassigned_ground_legs",
+)
+PENALTY_RESPONSE_METRICS = ("objective_value", *EXPECTED_METRICS)
+BASELINE_AIR_COST = 0.00077
+BASELINE_GROUND_COST = 0.000135
+FIGURE_WIDTH_INCHES = 6.5
+MIN_FIGURE_FONT_SIZE = 10
 METRICS = {
     "objective_value": ("Objective", "Objective value"),
     "n_ground_legs": ("Final ground links", "Mean links per shipment–scenario"),
@@ -163,7 +177,9 @@ def build_tables(
     for result in results:
         _validate_result(result)
         parameters = {field: float(result["parameters"][field]) for field in PARAMETERS}
+        print(f"Processing run {parameters} with {result['num_scenarios']} scenarios...")
         combination = tuple(parameters.values())
+        print(f"Combination: {combination}")
         if combination in seen_combinations:
             raise ValueError(f"Duplicate parameter combination: {parameters}")
         seen_combinations.add(combination)
@@ -175,15 +191,26 @@ def build_tables(
             "objective_value": float(objective) if objective is not None else float("nan"),
         }
         # No incumbent means unavailable metrics, not zero-link routes.
-        row.update(dict.fromkeys(LINK_METRICS, float("nan")))
+        row.update(dict.fromkeys((*LINK_METRICS, *EXPECTED_METRICS), float("nan")))
         if objective is not None:
-            totals = dict.fromkeys(LINK_METRICS, 0)
+            totals = dict.fromkeys((*LINK_METRICS, *EXPECTED_METRICS), 0.0)
             pair_count = 0
             for shipment, decisions in result["decision_variables_by_shipment"].items():
                 for scenario in range(result["num_scenarios"]):
                     # The JSON omits empty scenarios; include their zeros in the mean.
                     legs = decisions["recourse"].get(str(scenario), [])
                     counts = _count_links(legs, threshold)
+                    # Each edge variable occurs once in the mathematical sum.
+                    # Ignore duplicate serialized entries, as the grids do.
+                    reassigned = {
+                        (str(leg["origin"]), str(leg["destination"]), leg["mode"]):
+                        float(leg["reassign"]) for leg in legs
+                    }
+                    for mode in ("air", "ground"):
+                        counts[f"expected_reassigned_{mode}_legs"] = sum(
+                            value for (_, _, leg_mode), value in reassigned.items()
+                            if leg_mode == mode
+                        )
                     scenario_rows.append({
                         **parameters,
                         "shipment_id": str(shipment),
@@ -191,9 +218,9 @@ def build_tables(
                         **counts,
                     })
                     pair_count += 1
-                    for column in LINK_METRICS:
+                    for column in totals:
                         totals[column] += counts[column]
-            for column in LINK_METRICS:
+            for column in totals:
                 row[column] = totals[column] / pair_count
         run_rows.append(row)
     if not run_rows:
@@ -202,7 +229,7 @@ def build_tables(
         "runs": pd.DataFrame(run_rows).sort_values(list(PARAMETERS)).reset_index(drop=True),
         "recourse_scenarios": pd.DataFrame(
             scenario_rows,
-            columns=[*PARAMETERS, "shipment_id", "scenario", *LINK_METRICS],
+            columns=[*PARAMETERS, "shipment_id", "scenario", *LINK_METRICS, *EXPECTED_METRICS],
         ),
     }
 
@@ -253,17 +280,173 @@ def _draw_heatmap(
     axis.set_yticklabels([f"{value:.6g}" for value in matrix.index], rotation=0)
 
 
-def plot_tables(tables: Mapping[str, pd.DataFrame], output_dir: Path) -> None:
-    """Write five annotated PDFs with comparable colors across penalty panels."""
+def build_penalty_response(
+    runs: pd.DataFrame, *, baseline_air_cost: float = BASELINE_AIR_COST,
+    baseline_ground_cost: float = BASELINE_GROUND_COST,
+) -> pd.DataFrame:
+    """Summarize available runs at each penalty; never substitute a baseline.
+
+    Missing incumbents are excluded from bounds, and missing baseline runs stay
+    NaN so lines break rather than interpolate across unavailable observations.
+    Counts expose incomplete transportation-cost coverage in the exported CSV.
+    """
+    for name, value in (("baseline_air_cost", baseline_air_cost),
+                        ("baseline_ground_cost", baseline_ground_cost)):
+        if _number(value, name) < 0:
+            raise ValueError(f"{name} must be nonnegative.")
+    penalty = "cost_penalty_incompatibility"
+    baseline = runs.loc[
+        runs.cost_flight.map(lambda x: math.isclose(x, baseline_air_cost, rel_tol=1e-9, abs_tol=0))
+        & runs.cost_ground.map(lambda x: math.isclose(x, baseline_ground_cost, rel_tol=1e-9, abs_tol=0))
+    ].set_index(penalty)
+    summary = pd.DataFrame(index=sorted(runs[penalty].unique()))
+    summary.index.name = penalty
+    for metric in PENALTY_RESPONSE_METRICS:
+        grouped = runs.groupby(penalty)[metric]
+        summary[f"{metric}_baseline"] = baseline[metric].reindex(summary.index)
+        summary[f"{metric}_min"] = grouped.min()
+        summary[f"{metric}_max"] = grouped.max()
+        summary[f"{metric}_available_runs"] = grouped.count()
+    return summary
+
+
+def plot_penalty_response(
+    runs: pd.DataFrame, output_dir: Path, *,
+    baseline_air_cost: float = BASELINE_AIR_COST,
+    baseline_ground_cost: float = BASELINE_GROUND_COST,
+) -> None:
+    """Write reassignment and objective figures plus their auditable data."""
+    summary = build_penalty_response(
+        runs, baseline_air_cost=baseline_air_cost, baseline_ground_cost=baseline_ground_cost,
+    )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    summary.to_csv(output_dir / "sensitivity_penalty_response.csv")
+    # Include the reference even if that setting was not tested; no data marker
+    # or interpolated value is manufactured at this position.
+    settings = sorted(set(summary.index) | {100.0})
+    display = summary.reindex(settings)
+    positions = list(range(len(settings)))
+    tick_labels = [
+        f"{p:g}" if p in summary.index else f"{p:g}\n(reference only)" for p in settings
+    ]
+    font_settings = {
+        "font.size": MIN_FIGURE_FONT_SIZE,
+        "axes.titlesize": MIN_FIGURE_FONT_SIZE + 1,
+        "axes.labelsize": MIN_FIGURE_FONT_SIZE,
+        "xtick.labelsize": MIN_FIGURE_FONT_SIZE,
+        "ytick.labelsize": MIN_FIGURE_FONT_SIZE,
+        "legend.fontsize": MIN_FIGURE_FONT_SIZE,
+    }
+    with plt.rc_context(font_settings):
+        figure, axes = plt.subplots(
+            2, 1, sharex=True, figsize=(FIGURE_WIDTH_INCHES, 6.0)
+        )
+        for axis, mode, color in zip(
+            axes, ("air", "ground"), ("#276DAD", "#B55D27")
+        ):
+            metric = f"expected_reassigned_{mode}_legs"
+            if mode == "air":
+                axis.fill_between(
+                    positions, display[f"{metric}_min"].to_numpy(dtype=float),
+                    display[f"{metric}_max"].to_numpy(dtype=float),
+                    color=color, alpha=0.2,
+                    label="Range of expected number of reassigned air legs across tested transportation costs",
+                )
+            axis.plot(
+                positions, display[f"{metric}_baseline"], color=color, marker="o",
+                linewidth=2, label=f"Expected number of reassigned {mode} legs given baseline transportation costs",
+            )
+            axis.axvline(
+                settings.index(100.0), color="#666666", linestyle="--",
+                linewidth=1.2, label=r"Baseline penalty $c_{\mathrm{pen}}=100$",
+            )
+            axis.set_title(f"{mode.capitalize()} Reassignment", loc="left")
+            axis.set_ylabel(f"Expected Reassigned {mode.capitalize()} Legs\nper Shipment")
+            axis.grid(which="major", axis="both", alpha=0.25)
+            axis.margins(x=0.04, y=0.15)
+            if summary[f"{metric}_baseline"].isna().any():
+                warnings.warn(
+                    f"Missing {mode} baseline results at some penalties; line has gaps.",
+                    stacklevel=2,
+                )
+        axes[-1].set_xticks(positions, tick_labels)
+        axes[-1].set_xlabel(r"Reassignment Penalty $c_{\mathrm{pen}}$")
+        legend_lookup = {}
+        for axis in axes:
+            axis_handles, axis_labels = axis.get_legend_handles_labels()
+            legend_lookup.update(zip(axis_labels, axis_handles))
+        legend_labels = [
+            "Range of expected number of reassigned air legs across tested transportation costs",
+            "Expected number of reassigned air legs given baseline transportation costs",
+            "Expected number of reassigned ground legs given baseline transportation costs",
+            r"Baseline penalty $c_{\mathrm{pen}}=100$",
+        ]
+        legend_handles = [legend_lookup[label] for label in legend_labels]
+        figure.legend(
+            legend_handles, legend_labels, loc="lower center",
+            bbox_to_anchor=(0.5, 0.01), ncol=1, frameon=True,
+        )
+        figure.tight_layout(rect=(0, 0.15, 1, 1))
+        figure.savefig(output_dir / "sensitivity_penalty_response.pdf", bbox_inches="tight")
+        plt.close(figure)
+
+        metric = "objective_value"
+        figure, axis = plt.subplots(figsize=(FIGURE_WIDTH_INCHES, 4.1))
+        axis.fill_between(
+            positions, display[f"{metric}_min"].to_numpy(dtype=float),
+            display[f"{metric}_max"].to_numpy(dtype=float), color="#4C78A8", alpha=0.2,
+            label="Objective range across tested transportation costs",
+        )
+        axis.plot(
+            positions, display[f"{metric}_baseline"], color="#4C78A8", marker="o",
+            linewidth=2, label="Objective value",
+        )
+        axis.axvline(
+            settings.index(100.0), color="#666666", linestyle="--",
+            linewidth=1.2, label=r"Baseline penalty $c_{\mathrm{pen}}=100$",
+        )
+        axis.set(
+            xlabel=r"Reassignment Penalty $c_{\mathrm{pen}}$",
+            ylabel="Objective Value",
+        )
+        axis.set_xticks(positions, tick_labels)
+        axis.grid(which="major", axis="both", alpha=0.25)
+        axis.margins(x=0.04, y=0.15)
+        legend_handles, legend_labels = axis.get_legend_handles_labels()
+        figure.legend(
+            legend_handles, legend_labels, loc="lower center",
+            bbox_to_anchor=(0.5, 0.01), ncol=2, frameon=True,
+        )
+        if summary[f"{metric}_baseline"].isna().any():
+            warnings.warn(
+                "Missing objective baseline results at some penalties; line has gaps.",
+                stacklevel=2,
+            )
+        figure.tight_layout(rect=(0, 0.19, 1, 1))
+        figure.savefig(
+            output_dir / "sensitivity_objective_penalty_response.pdf",
+            bbox_inches="tight",
+        )
+        plt.close(figure)
+
+
+def plot_tables(
+    tables: Mapping[str, pd.DataFrame], output_dir: Path, *,
+    baseline_air_cost: float = BASELINE_AIR_COST,
+    baseline_ground_cost: float = BASELINE_GROUND_COST,
+) -> None:
+    """Write five heatmaps, two penalty-response PDFs, and a summary CSV."""
     output_dir.mkdir(parents=True, exist_ok=True)
     sns.set_theme(style="white", context="notebook")
     runs = tables["runs"]
     ground_costs = sorted(runs["cost_ground"].unique())
-    air_costs = sorted(runs["cost_flight"].unique())
+    # Heatmap rows render from top to bottom, so descending air costs put the
+    # greatest value at the top. Ground costs remain ascending left to right.
+    air_costs = sorted(runs["cost_flight"].unique(), reverse=True)
     penalties = sorted(runs["cost_penalty_incompatibility"].unique())
     rows = min(3, len(penalties))
     columns = math.ceil(len(penalties) / rows)
-    for metric, (title, label) in METRICS.items():
+    for metric, (_, label) in METRICS.items():
         figure, axes = plt.subplots(
             rows, columns, figsize=(4.5 * columns + 1, 4 * rows), squeeze=False
         )
@@ -296,9 +479,13 @@ def plot_tables(tables: Mapping[str, pd.DataFrame], output_dir: Path) -> None:
             )
         for axis in list(axes.flat)[len(penalties):]:
             axis.set_visible(False)
-        figure.suptitle(title)
         figure.savefig(output_dir / f"sensitivity_{metric}.pdf", bbox_inches="tight")
         plt.close(figure)
+
+    plot_penalty_response(
+        runs, output_dir, baseline_air_cost=baseline_air_cost,
+        baseline_ground_cost=baseline_ground_cost,
+    )
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -309,7 +496,15 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--output-dir", type=Path, default=Path(__file__).parent.parent / "output" / "figures" / "sensitivity" / "results_500",
-        help="Directory for the five PDF heatmaps.",
+        help="Directory for five PDF heatmaps, two penalty-response PDFs, and CSV.",
+    )
+    parser.add_argument(
+        "--baseline-air-cost", type=float, default=BASELINE_AIR_COST,
+        help="Air cost for the baseline response line (default: %(default)g).",
+    )
+    parser.add_argument(
+        "--baseline-ground-cost", type=float, default=BASELINE_GROUND_COST,
+        help="Ground cost for the baseline response line (default: %(default)g).",
     )
     parser.add_argument(
         "--active-threshold", type=float, default=1e-6,
@@ -322,8 +517,9 @@ def main() -> None:
     args = _build_parser().parse_args()
     results = load_results(args.input_dir)
     tables = build_tables(results, active_threshold=args.active_threshold)
-    plot_tables(tables, args.output_dir)
-    print(f"Processed {len(results)} runs and wrote five PDF figures to {args.output_dir.resolve()}")
+    plot_tables(tables, args.output_dir, baseline_air_cost=args.baseline_air_cost,
+                baseline_ground_cost=args.baseline_ground_cost)
+    print(f"Processed {len(results)} runs and wrote seven PDF figures and a summary CSV to {args.output_dir.resolve()}")
 
 
 if __name__ == "__main__":

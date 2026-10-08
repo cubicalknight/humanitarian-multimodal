@@ -575,7 +575,7 @@ class T100DataProcessing(DataProcessing):
             (pl.col("PASSENGERS") / pl.col("DEPARTURES_PERFORMED")).alias("PASSENGERS_PER_FLIGHT")
         ])
 
-        # NOTE for the time being we just average to a single value per route
+        # NOTE for the time being we just average to a single value per route to represent typical service
         df_per_flt = df_per_flt.group_by(["ORIGIN", "DEST"]).agg([
             pl.mean("PAYLOAD_PER_FLIGHT").alias("PAYLOAD_PER_FLIGHT"),
             pl.mean("FREIGHT_PER_FLIGHT").alias("FREIGHT_PER_FLIGHT"),
