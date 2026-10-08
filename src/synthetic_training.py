@@ -48,12 +48,27 @@ class SyntheticGeneratorConfig:
         Lower bound for the log-uniform weight sweep.
     w_d : float
         Offset subtracted from slack when augmenting shipping weights.
+    alpha_d : float | None
+        Optional slack multiplier, replacing the w_d offset.
+    allow_below_historical : bool
+        Permit augmented negatives below historical successful shipment weights.
     """
     seed: int = 42
     n_flights: int = 1
     k_swaps: int = 5
     loguniform_low: float = 100.
     w_d: float = 500.0
+    # alpha_d replaces the offset when provided.
+    alpha_d: float | None = None
+    allow_below_historical: bool = False
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(self.w_d) or self.w_d < 0:
+            raise ValueError("w_d must be finite and nonnegative")
+        if self.alpha_d is not None and (
+            not math.isfinite(self.alpha_d) or not 0 <= self.alpha_d <= 1
+        ):
+            raise ValueError("alpha_d must be finite and in [0, 1]")
 
 
 class HyperPrior:
@@ -120,7 +135,7 @@ class SyntheticDataGenerator:
         def sample_row(idx: int) -> tuple[pl.Series, torch.Tensor, float]:
             df_row = self.ship_dist[idx].clone()
 
-            tens_row = aug_obs_ship_tens[idx].clone()
+            tens_row = self.observed_ship_tensor[idx].clone()
 
             match = self.t100_df.filter((pl.col("ORIGIN") == df_row["ORIGIN"]) & (pl.col("DEST") == df_row["DEST"]))
             assert len(match) == 1, f"got {match} matches for {df_row['ORIGIN']} -> {df_row['DEST']}, expected 1"
@@ -137,9 +152,17 @@ class SyntheticDataGenerator:
                     print(f"Old index {idx} retrying with new index {new_idx}")
                     return sample_row(new_idx)
 
-            new_weight = slack_val - self.config.w_d
+            new_weight = (
+                slack_val * self.config.alpha_d
+                if self.config.alpha_d is not None
+                else slack_val - self.config.w_d
+            )
             assert new_weight >= 0, f"new_weight={new_weight} is negative for slack_val={slack_val}"
-            assert new_weight >= weight_val, f"new_weight={new_weight} is less than original weight_val={weight_val}"
+            if not self.config.allow_below_historical:
+                assert new_weight >= weight_val, (
+                    f"new_weight={new_weight} is less than original weight_val={weight_val}; "
+                    "use --allow-below-historical to permit this experiment"
+                )
 
             return df_row, tens_row, new_weight
 
@@ -658,23 +681,44 @@ def build_density_estimator(batch_theta: torch.Tensor, batch_x: torch.Tensor):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument(
+    augmentation = parser.add_mutually_exclusive_group()
+    augmentation.add_argument(
         "--w-d",
         type=float,
         default=500.0,
         help="Offset subtracted from slack when augmenting shipping weights.",
     )
+    augmentation.add_argument(
+        "--alpha-d", type=float, default=None,
+        help="Multiply slack by a factor in [0, 1] instead of subtracting --w-d.",
+    )
+    parser.add_argument(
+        "--allow-below-historical", action="store_true",
+        help="Permit augmented negatives below historical weights for either method.",
+    )
+    parser.add_argument("--num-simulations", type=int, default=100_000)
     args = parser.parse_args()
     if not math.isfinite(args.w_d) or args.w_d < 0:
         parser.error("--w-d must be finite and nonnegative.")
+    if args.alpha_d is not None and (
+        not math.isfinite(args.alpha_d) or not 0 <= args.alpha_d <= 1
+    ):
+        parser.error("--alpha-d must be finite and in [0, 1].")
+    if args.num_simulations <= 0:
+        parser.error("--num-simulations must be positive.")
     return args
 
 
 if __name__ == "__main__":
     # _demo()
     args = parse_args()
-    w_d_tag = str(args.w_d).removesuffix(".0")
-    generator = SyntheticDataGenerator(SyntheticGeneratorConfig(w_d=args.w_d))
+    augmentation_mode = "alpha_d" if args.alpha_d is not None else "w_d"
+    augmentation_value = args.alpha_d if args.alpha_d is not None else args.w_d
+    augmentation_tag = f"{augmentation_mode}_{str(augmentation_value).removesuffix('.0')}"
+    generator = SyntheticDataGenerator(SyntheticGeneratorConfig(
+        w_d=args.w_d, alpha_d=args.alpha_d,
+        allow_below_historical=args.allow_below_historical,
+    ))
 
     n_cats = len(generator.proc.cat_cols)
     print("cat_cols:", generator.proc.cat_cols)
@@ -767,12 +811,24 @@ if __name__ == "__main__":
     # sanity: eps medians should span a meaningful fraction of z_T100's scale,
     # not be uniformly tiny or uniformly huge relative to it
 
-    run_id = f"run_{datetime.datetime.now(tz=datetime.UTC).strftime('%Y%m%d_%H%M%S')}_{os.environ.get('SLURM_JOB_ID', 'local')}_w_d_{w_d_tag}"  # noqa: DTZ005
+    # run_id = f"run_{datetime.datetime.now(tz=datetime.UTC).strftime('%Y%m%d_%H%M%S')}_{os.environ.get('SLURM_JOB_ID', 'local')}_{augmentation_tag}"  # noqa: DTZ005
+    run_started_at = datetime.datetime.now(tz=datetime.UTC)
+    slurm_job_id = os.environ.get("SLURM_JOB_ID")
+    run_id = (
+        f"run_{run_started_at.strftime('%Y%m%d_%H%M%S')}_"
+        f"{slurm_job_id or 'local'}_{augmentation_tag}"
+    )
+
     base_run_dir = pathlib.Path("run_outputs") / run_id
     base_run_dir.mkdir(parents=True, exist_ok=True)
 
     diagnostics_path = base_run_dir / "diagnostics.json"
-    all_diagnostics = {}
+    all_diagnostics = {"configuration": {
+        "augmentation_mode": augmentation_mode,
+        "augmentation_value": augmentation_value,
+        "allow_below_historical": args.allow_below_historical,
+        "num_simulations": args.num_simulations,
+    }}
 
     num_rounds = 1
     posteriors = []
@@ -823,7 +879,7 @@ if __name__ == "__main__":
         theta, x = simulate_for_sbi(
             simulator,
             proposal,
-            num_simulations=100_000,
+            num_simulations=args.num_simulations,
             simulation_batch_size=1,
             seed=generator.config.seed,
         )
@@ -955,15 +1011,83 @@ if __name__ == "__main__":
     psi_std = np.sqrt(np.maximum(psi_sq_sum / n_done - psi_bar ** 2, 0.0))
     psi_mc_se = psi_std / np.sqrt(n_done)
 
+    # np.savez(
+    #     base_run_dir / f"psi_bar_{augmentation_tag}.npz",
+    #     psi_bar=psi_bar,
+    #     psi_std=psi_std,
+    #     psi_mc_se=psi_mc_se,
+    #     n_design=generator.n_design,
+    #     n_draws=n_done,
+    #     final_round=num_rounds - 1,
+    #     augmentation_mode=augmentation_mode,
+    #     augmentation_value=augmentation_value,
+    #     w_d=generator.config.w_d if args.alpha_d is None else np.nan,
+    #     alpha_d=args.alpha_d if args.alpha_d is not None else np.nan,
+    #     allow_below_historical=args.allow_below_historical,
+    #     num_simulations=args.num_simulations,
+    # )
+
+    artifact_path = base_run_dir / f"psi_bar_{augmentation_tag}.npz"
+    artifact_metadata = {
+        "schema_version": 1,
+        "artifact_type": "posterior_psi_summary",
+        "created_at_utc": datetime.datetime.now(
+            tz=datetime.UTC
+        ).isoformat(),
+        "run_id": run_id,
+        "slurm_job_id": slurm_job_id,
+        "configuration": {
+            "seed": generator.config.seed,
+            "augmentation_mode": augmentation_mode,
+            "augmentation_value": augmentation_value,
+            "w_d": (
+                generator.config.w_d
+                if args.alpha_d is None
+                else None
+            ),
+            "alpha_d": args.alpha_d,
+            "allow_below_historical": args.allow_below_historical,
+            "num_simulations": args.num_simulations,
+            "num_rounds": num_rounds,
+            "prior_std": std,
+        },
+        "dimensions": {
+            "n_design": generator.n_design,
+            "n_psi": len(psi_bar),
+        },
+        "posterior_summary": {
+            "n_draws": n_done,
+            "final_round": num_rounds - 1,
+        },
+        "software": {
+            "python": sys.version.split()[0],
+            "numpy": np.__version__,
+            "torch": torch.__version__,
+        },
+    }
+
     np.savez(
-        base_run_dir / f"psi_bar_w_d_{w_d_tag}.npz",
+        artifact_path,
         psi_bar=psi_bar,
         psi_std=psi_std,
         psi_mc_se=psi_mc_se,
+        # JSON remains readable with np.load(..., allow_pickle=False).
+        metadata=json.dumps(artifact_metadata, sort_keys=True),
+        metadata_schema_version=artifact_metadata["schema_version"],
+        # Retain flat fields for backward compatibility.
         n_design=generator.n_design,
         n_draws=n_done,
         final_round=num_rounds - 1,
-        w_d=generator.config.w_d,
+        augmentation_mode=augmentation_mode,
+        augmentation_value=augmentation_value,
+        w_d=generator.config.w_d if args.alpha_d is None else np.nan,
+        alpha_d=args.alpha_d if args.alpha_d is not None else np.nan,
+        allow_below_historical=args.allow_below_historical,
+        num_simulations=args.num_simulations,
     )
-    print(f"Saved E[psi] from final round ({num_rounds - 1}) over {n_done} draws.")
+    print(
+        f"Saved E[psi] and metadata to {artifact_path} from final round "
+        f"({num_rounds - 1}) over {n_done} draws."
+    )
+
     print(f"Max MC SE across coords: {psi_mc_se.max():.4g}")
