@@ -592,6 +592,28 @@ class TwoStageSolver:
                 else self.incoming
             )
 
+            # Optimize a separate node ordering for each shipment. Flow balance
+            # alone permits disconnected or attached circulations, including
+            # unused first-stage links whose costs are refunded in recourse.
+            routes = (
+                self.feasible_by_shipment[shipment]
+                if self.restrict_first_stage
+                else self.R
+            )
+            route_nodes = sorted({node for i, j, _ in routes for node in (i, j)})
+            node_count = len(route_nodes)
+            order = model.addVars(
+                route_nodes, lb=0.0, ub=node_count - 1,
+                vtype=GRB.CONTINUOUS, name=f"first_stage_order_{shipment}",
+            )
+            model.addConstrs(
+                (
+                    order[j] >= order[i] + 1 - node_count * (1 - x[shipment, i, j, mode])
+                    for i, j, mode in routes
+                ),
+                name=f"first_stage_acyclic_{shipment}",
+            )
+
             for l in self.nodes:
                 flow_out = gp.quicksum(
                     x[shipment, *route]

@@ -80,7 +80,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "solver": {
         "threads": None,
         "time_limit_seconds": None,
-        "mip_gap": None,
+        "mip_gap": 0.0,
         "quiet": False,
     },
     "network": {
@@ -763,6 +763,8 @@ class SensitivityRunner:
             stages[name] = {
                 "status": int(model.Status),
                 "solution_count": int(model.SolCount),
+                "mip_gap": float(model.MIPGap) if model.SolCount else None,
+                "objective_bound": float(model.ObjBound) if model.SolCount else None,
                 "runtime_seconds": float(model.Runtime),
             }
 
@@ -1131,6 +1133,8 @@ class SensitivityRunner:
             model.Params.TimeLimit = float(options["time_limit_seconds"])
         if options["mip_gap"] is not None:
             model.Params.MIPGap = float(options["mip_gap"])
+            if float(options["mip_gap"]) == 0.0:
+                model.Params.MIPGapAbs = 0.0
 
     def _build_result(
         self,
@@ -1186,6 +1190,8 @@ class SensitivityRunner:
             ),
             "status": int(model.Status),
             "objective_value": float(model.ObjVal) if has_solution else None,
+            "mip_gap": float(model.MIPGap) if has_solution else None,
+            "objective_bound": float(model.ObjBound) if has_solution else None,
             "runtime_seconds": float(model.Runtime),
             "decision_variables_by_shipment": decisions,
         }
