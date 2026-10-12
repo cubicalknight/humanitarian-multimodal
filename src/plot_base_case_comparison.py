@@ -1,9 +1,10 @@
 """Plot four baseline objectives and first-stage/recourse ground and air links.
 
 Run: poetry run python src/plot_base_case_comparison.py
-First-stage link counts are shown as four stacked horizontal frequency plots
-with a shared shipment-count axis. Recourse bars show means, with min--max
-whiskers, per shipment/scenario. Explicit paths resolve from the working
+First-stage and recourse link counts are shown as four stacked horizontal
+frequency plots with shared shipment-count axes. Each recourse subplot includes
+kept and reassigned links over a wider first-stage frequency bar, with each
+shipment repeated across its scenarios. Explicit paths resolve from the working
 directory.
 """
 
@@ -21,7 +22,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
-from matplotlib.ticker import MaxNLocator
+from matplotlib.ticker import MaxNLocator, MultipleLocator
 
 CASES = (
     "integrated_restricted", "integrated_unrestricted",
@@ -31,6 +32,7 @@ LABELS = ["Integrated\nRestricted", "Integrated\nUnrestricted",
           "Myopic\nRestricted", "Myopic\nUnrestricted"]
 COLORS = ["#1f77b4", "#79aed2", "#d62728", "#e99494"]
 PLOT_WIDTH = 6.5
+PLOT_HEIGHT = 7
 
 
 def load_results(input_dir: Path) -> list[dict]:
@@ -96,15 +98,12 @@ def _save(fig, output_dir: Path, stem: str) -> None:
     plt.close(fig)
 
 
-def _count_bar(axis, position, values, *, width, color, label=None):
-    if values.empty:
-        axis.text(position, 0.03, "N/A", transform=axis.get_xaxis_transform(),
-                  ha="center", fontsize=10, rotation=90)
-        return
-    mean = values.mean()
-    axis.bar(position, mean, width=width, color=color, label=label,
-             yerr=np.array([[mean - values.min()], [values.max() - mean]]),
-             capsize=3, error_kw={"elinewidth": 1})
+def _set_link_count_ticks(axis) -> None:
+    """Mark every integer link count while labeling a readable subset."""
+    axis.yaxis.set_major_locator(MaxNLocator(integer=True, nbins=6))
+    axis.yaxis.set_minor_locator(MultipleLocator(1))
+    axis.tick_params(axis="y", which="major", left=True, direction="out", length=5)
+    axis.tick_params(axis="y", which="minor", left=True, direction="out", length=3)
 
 
 def plot_tables(tables: dict[str, pd.DataFrame], output_dir: Path) -> None:
@@ -139,14 +138,14 @@ def plot_tables(tables: dict[str, pd.DataFrame], output_dir: Path) -> None:
         data = data[data["mode"] == mode]
         max_links = int(data["count"].max()) if not data.empty else 0
         levels = np.arange(max_links + 1)
-        fig, axes = plt.subplots(4, 1, figsize=(PLOT_WIDTH, 8), sharex=True)
+        fig, axes = plt.subplots(4, 1, figsize=(PLOT_WIDTH, PLOT_HEIGHT), sharex=True)
         for i, (axis, case) in enumerate(zip(axes, CASES, strict=True)):
             values = data.loc[data["case"] == case, "count"]
             frequencies = values.value_counts().reindex(levels, fill_value=0)
             axis.barh(levels, frequencies, height=0.68, color=COLORS[i])
             axis.set_title(LABELS[i].replace("\n", " "), loc="left", fontsize=10)
-            axis.set_yticks(levels)
             axis.set_ylim(-0.55, max_links + 0.55)
+            _set_link_count_ticks(axis)
             axis.grid(axis="y", visible=False)
             if values.empty:
                 axis.text(0.5, 0.5, "N/A", transform=axis.transAxes,
@@ -158,25 +157,53 @@ def plot_tables(tables: dict[str, pd.DataFrame], output_dir: Path) -> None:
         _save(fig, output_dir, f"first_stage_{mode}_links")
 
     for mode in ("ground", "air"):
-        fig, axis = plt.subplots(figsize=(PLOT_WIDTH, 4.8))
         data = tables["final"]
         data = data[data["mode"] == mode]
-        for i, case in enumerate(CASES):
-            values = data[data["case"] == case]
+        recourse = data[data["metric"].isin(("Kept", "Reassigned"))]
+        # Repeat each first-stage count once per shipment/scenario, matching
+        # the observation population used by the recourse distributions.
+        pairs = data[["case", "shipment", "scenario", "mode"]].drop_duplicates()
+        first_repeated = pairs.merge(tables["first"], on=["case", "shipment", "mode"],
+                                     how="inner", validate="many_to_one")
+        counts = pd.concat([recourse["count"], first_repeated["count"]])
+        max_links = int(counts.max()) if not counts.empty else 0
+        # Only the first-stage reference may show a zero-count bin.
+        min_links = 0 if first_repeated["count"].eq(0).any() else 1
+        levels = np.arange(min_links, max(max_links, 1) + 1)
+        recourse_levels = levels[levels > 0]
+        fig, axes = plt.subplots(4, 1, figsize=(PLOT_WIDTH, PLOT_HEIGHT), sharex=True)
+        for axis, case in zip(axes, CASES, strict=True):
+            case_data = recourse[recourse["case"] == case]
+            first_counts = first_repeated.loc[first_repeated["case"] == case, "count"]
+            first_frequencies = first_counts.value_counts().reindex(levels, fill_value=0)
+            axis.barh(levels, first_frequencies, height=0.86, color="#cbd0d6",
+                      edgecolor="#8a9199", linewidth=0.7,
+                      label="First stage × scenarios", zorder=2)
             for offset, metric, color in zip(
-                (-0.13, 0.13), ("Kept", "Reassigned"),
+                (-0.18, 0.18), ("Kept", "Reassigned"),
                 ("#59a14f", "#f28e2b"), strict=True,
             ):
-                _count_bar(axis, i + offset, values.loc[values["metric"] == metric, "count"],
-                           width=0.24, color=color)
+                values = case_data.loc[case_data["metric"] == metric, "count"]
+                frequencies = values.value_counts().reindex(recourse_levels, fill_value=0)
+                axis.barh(recourse_levels + offset, frequencies, height=0.32,
+                          color=color, label=metric, zorder=3)
+            axis.set_title(LABELS[CASES.index(case)].replace("\n", " "),
+                           loc="left", fontsize=10)
+            axis.set_ylim(min_links - 0.55, max(max_links, 1) + 0.55)
+            _set_link_count_ticks(axis)
+            axis.grid(axis="y", visible=False)
+            if case_data.empty:
+                axis.text(0.5, 0.5, "N/A", transform=axis.transAxes,
+                          ha="center", va="center", fontsize=10)
         from matplotlib.patches import Patch
-        axis.legend(handles=[Patch(color=color, label=label) for color, label in
-                             (("#59a14f", "Kept"), ("#f28e2b", "Reassigned"))],
-                    frameon=False, loc="upper center", bbox_to_anchor=(0.5, -0.18), ncol=2)
-        axis.set(title=f"Recourse {mode} links\nMean and min-max per shipment/scenario",
-                 ylabel=f"Active {mode} links", ylim=(0, None), xlim=(-0.6, 3.6))
-        axis.yaxis.set_major_locator(MaxNLocator(integer=True))
-        axis.set_xticks(range(4), LABELS)
+        fig.legend(handles=[Patch(color=color, label=label) for color, label in
+                            (("#cbd0d6", "First Stage Assignments × Scenarios"),
+                             ("#59a14f", "Kept"), ("#f28e2b", "Reassigned"))],
+                   frameon=False, loc="lower center",
+                   bbox_to_anchor=(0.5, -0.05), ncol=3)
+        axes[-1].xaxis.set_major_locator(MaxNLocator(integer=True))
+        fig.supxlabel("Number of Shipment-Scenario Pairs")
+        fig.supylabel(f"Active {mode.capitalize()} Links per Shipment-Scenario")
         _save(fig, output_dir, f"final_{mode}_links")
 
 
